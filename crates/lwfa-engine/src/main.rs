@@ -38,6 +38,9 @@ mod preview;
 mod upload;
 mod handlers;
 mod headless;
+mod color;
+mod color_management;
+mod color_render;
 mod output;
 mod http;
 mod icons;
@@ -718,6 +721,8 @@ fn sync_stream_codec(state: &mut Lwfa, previous: Option<lwfa_proto::Codec>) {
         return;
     }
     let codec = state.codec_for_all();
+    state.capture.set_hdr(codec == Some(lwfa_proto::Codec::HevcHdr));
+    state.color_state.set_hdr(codec == Some(lwfa_proto::Codec::HevcHdr));
     if let Some(worker) = state.encoders.as_ref() {
         worker.set_codec(codec);
     }
@@ -1500,6 +1505,9 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
         }
 
         ToEngine::SetStreams { windows, codecs } => {
+            if let Some(shell) = state.shell.as_ref() {
+                shell.clients().set_hdr(session, codecs.contains(&lwfa_proto::Codec::HevcHdr));
+            }
             let previous_codec = state.codec_for_all();
             // Per connection, not global: a phone and a tablet are looking at
             // different parts of the same strip, so what each can see is its

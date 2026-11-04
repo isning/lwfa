@@ -139,3 +139,6 @@ if you forgot.
 
 See [headless verification](headless.md#verification) for the driver-dependent
 GLES pixel test and the no-host Wayland/stream/disconnect smoke test.
+
+See [color management and HDR](color-management.md) for named source spaces,
+Main10/PQ streaming, viewer requirements and color-specific verification.

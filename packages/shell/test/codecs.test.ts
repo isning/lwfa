@@ -95,7 +95,7 @@ describe("choosing for one client", () => {
   it("prefers HEVC when it is on offer", () => {
     // Roughly a third fewer bits for the same picture.
     expect(choose(["h264", "hevc"])).toBe("hevc")
-    expect(PREFERENCE[0]).toBe("hevc")
+    expect(PREFERENCE[0]).toBe("hevcHdr")
   })
 
   it("falls back to H.264 rather than refusing", () => {
@@ -196,5 +196,13 @@ describe("stream parameter sets", () => {
   it("reads H264 profile and level instead of using the initial family probe", async () => {
     const { codecFromAnnexB } = await import("../src/lib/codecs")
     expect(codecFromAnnexB(new Uint8Array([0,0,1,0x67,0x4d,0x40,0x33]), "h264")).toBe("avc1.4D4033")
+  })
+})
+
+describe("HDR negotiation", () => {
+  it("requires HDR support from every viewer", () => {
+    expect(chooseForAll([["hevcHdr", "hevc"], ["hevc"]])).toBe("hevc")
+    expect(chooseForAll([["hevcHdr", "hevc"], ["hevcHdr"]])).toBe("hevcHdr")
+    expect(chooseForAll([["hevcHdr"], []])).toBeNull()
   })
 })

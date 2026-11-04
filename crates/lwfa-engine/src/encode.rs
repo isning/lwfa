@@ -51,6 +51,7 @@ pub struct EncodedFrame {
 }
 
 struct Session {
+    color_generation: u64,
     /// Which codec this session encodes, so frames can be labelled.
     codec: lwfa_proto::Codec,
     /// The rate it was built with, so a changed share can be noticed.
@@ -252,7 +253,9 @@ impl Encoders {
     /// `&mut` because the frame's pts and picture type are stamped in place;
     /// the pixels themselves are read, not written.
     pub fn encode(&mut self, frame: &mut CapturedFrame) -> Option<EncodedFrame> {
-        if self.available && self.codec.is_some() && self.ensure_session(frame) {
+        if self.available && self.codec.is_some()
+            && (frame.hdr == (self.codec == Some(lwfa_proto::Codec::HevcHdr)))
+            && self.ensure_session(frame) {
             if let Some(encoded) = self.encode_video(frame) {
                 return Some(encoded);
             }
@@ -274,17 +277,17 @@ impl Encoders {
         // Streaming again, so it is no longer a candidate for reclaiming.
         let returning = self.retired.remove(&frame.id).is_some();
 
-        if let Some((width, height, bitrate)) = self
+        if let Some((width, height, bitrate, color_generation)) = self
             .sessions
             .get(&frame.id)
-            .map(|s| (s.width, s.height, s.bitrate))
+            .map(|s| (s.width, s.height, s.bitrate, s.color_generation))
         {
             // A returning window's session was built for whatever the budget
             // was when it left. Reusing it as-is would quietly ignore the share
             // it has now, so it is rebuilt on the same threshold `set_rates`
             // uses, and only when the share really moved.
             let stale = returning && worth_rebuilding(bitrate, self.rate_for(frame.id));
-            if width == frame.width && height == frame.height && !stale {
+            if width == frame.width && height == frame.height && !stale && color_generation == frame.color_generation {
                 return true;
             }
             // Resized. H.264 cannot change resolution mid-stream, so the
@@ -369,7 +372,7 @@ fn worth_rebuilding(from: u32, to: u32) -> bool {
 /// it, and spends roughly a third fewer bits for the same picture.
 fn encoder_name(codec: lwfa_proto::Codec) -> &'static str {
     match codec {
-        lwfa_proto::Codec::Hevc => "hevc_nvenc",
+        lwfa_proto::Codec::Hevc | lwfa_proto::Codec::HevcHdr => "hevc_nvenc",
         lwfa_proto::Codec::H264 => "h264_nvenc",
     }
 }
@@ -389,7 +392,14 @@ impl Session {
 
         enc.set_width(width);
         enc.set_height(height);
-        if crate::cuda::is_gpu(&frame.frame) {
+        if frame.hdr {
+            if wanted != lwfa_proto::Codec::HevcHdr { return Err(ff::Error::InvalidData); }
+            enc.set_format(Pixel::P010LE);
+            enc.set_color_primaries(ff::color::Primaries::BT2020);
+            enc.set_color_transfer_characteristic(ff::color::TransferCharacteristic::SMPTE2084);
+            enc.set_colorspace(ff::color::Space::BT2020NCL);
+            enc.set_color_range(ff::color::Range::MPEG);
+        } else if crate::cuda::is_gpu(&frame.frame) {
             // The frame is already on the GPU: name its pool and NVENC reads
             // it in place. Nothing crosses the bus but the bitstream.
             enc.set_format(Pixel::CUDA);
@@ -404,6 +414,15 @@ impl Session {
             // matrix swscale used, so colours did not shift when the stage
             // moved.
             enc.set_format(Pixel::RGBZ);
+        }
+        if !frame.hdr {
+            // NVENC's RGB input conversion uses BT.601 coefficients. Signal
+            // that matrix explicitly, while preserving the sRGB source's
+            // BT.709 primaries and sRGB transfer (also for HD-sized windows).
+            enc.set_color_primaries(ff::color::Primaries::BT709);
+            enc.set_color_transfer_characteristic(ff::color::TransferCharacteristic::IEC61966_2_1);
+            enc.set_colorspace(ff::color::Space::SMPTE170M);
+            enc.set_color_range(ff::color::Range::MPEG);
         }
         enc.set_time_base(ff::Rational(1, 60));
         // Keyframe interval, and so also the worst case wait before a newly
@@ -424,6 +443,7 @@ impl Session {
         // milliseconds on the dedicated encoder thread, which the zero-copy
         // path has left mostly idle, and spends the same bits far better.
         opts.set("preset", "p4");
+        if frame.hdr { opts.set("profile", "main10"); }
         opts.set("tune", "ull"); // ultra low latency
         opts.set("zerolatency", "1");
         opts.set("delay", "0");
@@ -444,6 +464,7 @@ impl Session {
 
         Ok(Self {
             encoder,
+            color_generation: frame.color_generation,
             width,
             height,
             codec: wanted,
@@ -496,6 +517,7 @@ impl Session {
             // from the bitstream.
             format: match self.codec {
                 lwfa_proto::Codec::Hevc => FrameFormat::Hevc,
+                lwfa_proto::Codec::HevcHdr => FrameFormat::HevcHdr,
                 lwfa_proto::Codec::H264 => FrameFormat::H264,
             },
             keyframe,
@@ -639,6 +661,27 @@ mod tests {
                 pair[1], pair[0],
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a working HEVC Main10 NVENC encoder"]
+    fn source_color_changes_force_a_new_hdr_keyframe() {
+        let code = (crate::color::encode_pq(203.0)*1023.0).round() as u32;
+        let packed = code | code << 10 | code << 20 | 3 << 30;
+        let bytes: Vec<_> = (0..320*240).flat_map(|_| packed.to_ne_bytes()).collect();
+        let mut frame = CapturedFrame {
+            id: WindowId(1), width: 320, height: 240, hdr: true, hdr_peak: 203.0, color_generation: 1,
+            frame: crate::capture::PooledFrame::owned(crate::color::p010_from_rgb10(&bytes,320,240)),
+        };
+        let mut encoders = Encoders::default();
+        encoders.set_codec(Some(lwfa_proto::Codec::HevcHdr));
+        let first = encoders.encode(&mut frame).unwrap();
+        assert_eq!(first.format, FrameFormat::HevcHdr);
+        assert!(first.keyframe);
+        frame.color_generation = 2;
+        let changed = encoders.encode(&mut frame).unwrap();
+        assert_eq!(changed.format, FrameFormat::HevcHdr);
+        assert!(changed.keyframe, "a description-only change must not wait for the GOP");
     }
 
     #[test]

@@ -113,6 +113,9 @@ const IDLE_PROBE_MS = 3_000
 const WATCHDOG_MS = 1_000
 
 export class Connection {
+  #hdrSupport: boolean | undefined
+  #hdrProbe: Promise<void> | null = null
+  #streams: Extract<ToEngine, { type: "setStreams" }> | null = null
   #url: string
   #handlers: ConnectionHandlers
   #socket: WebSocket | null = null
@@ -230,6 +233,8 @@ export class Connection {
     if (this.#closed) return
     this.#handlers.onStatus("connecting")
 
+    this.#hdrSupport = undefined
+    this.#hdrProbe = null
     const socket = new WebSocket(this.#url)
     this.#socket = socket
     // Nothing has arrived on *this* socket yet, and the previous one's clock
@@ -385,6 +390,28 @@ export class Connection {
 
   send(message: ToEngine): void {
     if (this.#socket?.readyState !== WebSocket.OPEN) return
+    if (message.type === "setStreams") {
+      this.#streams = message
+      if (message.codecs.includes("hevcHdr") && this.#hdrSupport === undefined && !this.#hdrProbe) {
+        const socket = this.#socket
+        this.#hdrProbe = (async () => {
+          let supported = false
+          try {
+            const url = new URL(this.#url)
+            url.protocol = url.protocol === "wss:" ? "https:" : "http:"
+            url.pathname = url.pathname.replace(/\/$/, "") + "/capabilities.json"
+            url.search = ""
+            const response = await fetch(url, { cache: "no-store", credentials: "omit", signal: AbortSignal.timeout(5000) })
+            const body: unknown = await response.json()
+            supported = response.ok && typeof body === "object" && body !== null && "codecs" in body && Array.isArray(body.codecs) && body.codecs.includes("hevcHdr")
+          } catch { /* An older engine has no feature endpoint: stay on SDR. */ }
+          if (this.#socket !== socket || this.#closed) return
+          this.#hdrSupport = supported
+          if (supported && this.#streams) this.send(this.#streams)
+        })()
+      }
+      if (this.#hdrSupport !== true) message = { ...message, codecs: message.codecs.filter((codec) => codec !== "hevcHdr") }
+    }
     this.#socket.send(encode(message))
   }
 

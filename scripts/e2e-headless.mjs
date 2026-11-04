@@ -13,6 +13,7 @@ import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { FrameFormat, decodeFrame, decodeToShell, encode } from "../packages/proto/src/index.ts"
 
+const hdrOutput = !!process.env.LWFA_TEST_HDR && !process.env.LWFA_TEST_HDR_FALLBACK
 const enginePath = process.env.LWFA_TEST_ENGINE
 const clientPath = process.env.LWFA_TEST_SHM_CLIENT
 assert(enginePath && clientPath, "set LWFA_TEST_ENGINE and LWFA_TEST_SHM_CLIENT to built binaries")
@@ -47,6 +48,7 @@ persistent = false
 desktop = false
 [stream]
 gpu_direct = false
+${process.env.LWFA_TEST_HDR_FALLBACK ? "max_h264_sessions = 0" : ""}
 `)
 
 function start(name, binary, overrides = {}) {
@@ -73,8 +75,8 @@ async function until(predicate, description, timeout = 15_000) {
   throw new Error(`timed out: ${description}`)
 }
 
-async function connect(port) {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/?token=${token}&client=headless-smoke`)
+async function connect(port, client = "headless-smoke") {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/?token=${token}&client=${client}`)
   sockets.push(socket)
   socket.binaryType = "arraybuffer"
   const messages = [], frames = []
@@ -103,22 +105,34 @@ async function close(socket) {
   await until(() => socket.readyState === WebSocket.CLOSED, "WebSocket close", 5_000)
 }
 
-async function verifyStream(connection, id, filename) {
+async function verifyStream(connection, id, filename, expectedHdr = hdrOutput, codecs = process.env.LWFA_TEST_HDR ? ["hevcHdr"] : []) {
+  connection.frames.length = 0
   connection.send({ type: "setViewport", width: 800, height: 600, scale: 1 })
   await connection.wait(() => (connection.hello.output.width === 800 && connection.hello.output.height === 600) || connection.messages.find((message) => message.type === "outputChanged" && message.output.width === 800 && message.output.height === 600), "headless viewport resize")
   connection.send({ type: "setLayout", windows: [{ id, rect: { x: 0, y: 0, w: 320, h: 240 }, z: 0 }], animate: null })
-  connection.send({ type: "setStreams", windows: [id], codecs: [] })
-  const frame = await connection.wait(() => connection.frames.find((frame) => frame.header.window === id), "window JPEG")
-  assert.equal(frame.header.format, FrameFormat.Jpeg)
+  connection.send({ type: "setStreams", windows: [id], codecs })
+  const frame = await connection.wait(() => connection.frames.find((frame) => frame.header.window === id && frame.header.format === (expectedHdr ? FrameFormat.HevcHdr : FrameFormat.Jpeg) && frame.header.keyframe), "self-contained window frame")
+  assert.equal(frame.header.format, expectedHdr ? FrameFormat.HevcHdr : FrameFormat.Jpeg)
   assert.equal(frame.header.width, 320)
   assert.equal(frame.header.height, 240)
-  const path = join(directory, filename)
+  const path = join(directory, expectedHdr ? `${filename}.hevc` : filename)
   writeFileSync(path, frame.payload)
+  if (expectedHdr) {
+    const probe = spawnSync(process.env.LWFA_TEST_FFPROBE ?? "ffprobe", ["-v", "error", "-show_streams", "-of", "json", path])
+    assert.equal(probe.status, 0, probe.stderr?.toString())
+    const stream = JSON.parse(probe.stdout.toString()).streams[0]
+    assert.equal(stream.profile, "Main 10")
+    assert.equal(stream.pix_fmt, "yuv420p10le")
+    assert.equal(stream.color_primaries, "bt2020")
+    assert.equal(stream.color_transfer, "smpte2084")
+    assert.equal(stream.color_space, "bt2020nc")
+    assert.equal(stream.color_range, "tv")
+  }
   const decoded = spawnSync(process.env.LWFA_TEST_FFMPEG ?? "ffmpeg", ["-v", "error", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"], { maxBuffer: 2 * 1024 * 1024 })
   assert.equal(decoded.status, 0, decoded.stderr?.toString())
   assert.equal(decoded.stdout.length, 320 * 240 * 4)
   const center = (120 * 320 + 160) * 4
-  for (const [channel, expected] of [204, 51, 34, 255].entries()) {
+  for (const [channel, expected] of (expectedHdr ? [130,130,130,255] : process.env.LWFA_TEST_COLOR ? [158,158,158,255] : [204,51,34,255]).entries()) {
     assert(Math.abs(decoded.stdout[center + channel] - expected) <= 8, "decoded pixels must belong to the test client")
   }
 }
@@ -129,7 +143,19 @@ try {
     assert.equal(engine.exitCode, null, "engine exited during startup")
     return logs.engine.match(/open the shell at:\s+http:\/\/127\.0\.0\.1:(\d+)/)?.[1]
   }, "isolated engine listener")
+  if (process.env.LWFA_TEST_COLOR) {
+    const response = await fetch(`http://127.0.0.1:${port}/engine/capabilities.json`, { signal: AbortSignal.timeout(5000) })
+    assert.equal(response.status, 200)
+    assert((await response.json()).codecs.includes("hevcHdr"), "engine must expose the additive HDR feature probe")
+  }
   const display = await until(() => readdirSync(env.XDG_RUNTIME_DIR).find((file) => /^wayland-\d+$/.test(file)), "Wayland socket")
+  if (process.env.LWFA_TEST_COLOR) {
+    for (const invalid of ["mastering", "duplicate", "incomplete"]) {
+      const probe = start("client", clientPath, { WAYLAND_DISPLAY: display, LWFA_TEST_COLOR_INVALID: invalid })
+      await until(() => probe.exitCode !== null || probe.signalCode !== null, `protocol rejection: ${invalid}`)
+      assert.equal(probe.exitCode, 0, `wrong protocol error for ${invalid}`)
+    }
+  }
   const client = start("client", clientPath, { WAYLAND_DISPLAY: display })
   const frameCount = () => [...logs.client.matchAll(/^frame \d+$/gm)].length
   await until(() => frameCount() >= 2, "frame callbacks before a browser connects")
@@ -137,6 +163,13 @@ try {
   const window = first.hello.windows.find((window) => window.appId === "lwfa-headless-smoke")
   assert(window, "the native Wayland application must be in the session")
   await verifyStream(first, window.id, "first.jpg")
+  if (hdrOutput) {
+    const sdr = await connect(port, "headless-smoke-sdr")
+    await verifyStream(sdr, window.id, "mixed-sdr.jpg", false, [])
+    await first.wait(() => first.frames.some((frame) => frame.header.format === FrameFormat.Jpeg), "SDR viewer must downgrade the shared rendition")
+    await close(sdr.socket)
+    await verifyStream(first, window.id, "restored-hdr.jpg")
+  }
   await close(first.socket)
   const disconnectedMs = Number(process.env.LWFA_TEST_DISCONNECT_MS ?? 46_000)
   assert(Number.isFinite(disconnectedMs) && disconnectedMs >= 0, "invalid disconnect duration")
@@ -148,7 +181,7 @@ try {
   const second = await connect(port)
   assert(second.hello.windows.some((candidate) => candidate.id === window.id), "reconnect must restore the same window")
   await verifyStream(second, window.id, "reconnected.jpg")
-  console.log(`PASS: no-host EGL, wl_shm, viewport, decoded JPEG pixels, ${disconnectedMs}ms disconnect and same-window reconnect`)
+  console.log(`PASS: no-host EGL, wl_shm, viewport, decoded ${hdrOutput ? "Main10/PQ" : "JPEG"} pixels, ${disconnectedMs}ms disconnect and same-window reconnect`)
 } finally {
   for (const socket of sockets) await close(socket).catch(() => {})
   for (const child of children.reverse()) {

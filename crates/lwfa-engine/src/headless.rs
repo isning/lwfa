@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Create a renderer without touching a host Wayland/X11 connection.
-fn renderer(render_node: Option<&Path>) -> Result<GlesRenderer, Box<dyn std::error::Error>> {
+pub(crate) fn renderer(render_node: Option<&Path>) -> Result<GlesRenderer, Box<dyn std::error::Error>> {
     let mut devices: Vec<_> = EGLDevice::enumerate()
         .map_err(|err| format!("cannot enumerate headless EGL devices: {err}; check the EGL driver and device enumeration extensions"))?
         .collect();
@@ -74,6 +74,7 @@ pub fn init(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = state.config.backend.size()?;
     let mut renderer = renderer(state.config.backend.render_node.as_deref())?;
+    crate::color_render::init_backend(state, &mut renderer);
     let output = crate::output::init(state, "lwfa-headless", "headless", size, Transform::Normal);
     let tick = state.config.render.tick().max(Duration::from_millis(1));
     event_loop

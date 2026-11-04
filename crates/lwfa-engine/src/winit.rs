@@ -35,7 +35,7 @@ use crate::config;
 use crate::state::{CalloopData, Lwfa};
 
 type PreviewElement = CropRenderElement<
-    RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+    RelocateRenderElement<RescaleRenderElement<crate::color_render::PreviewElement>>,
 >;
 
 /// Fit the session into the host without changing its opacity or aspect ratio.
@@ -73,8 +73,9 @@ fn project_element<E: Element>(
     CropRenderElement::from_element(element, 1.0, crop)
 }
 
-fn preview_elements(state: &Lwfa, renderer: &mut GlesRenderer, fit: f64) -> Vec<PreviewElement> {
+fn preview_elements(state: &Lwfa, renderer: &mut GlesRenderer, fit: f64, colors: &mut crate::color_render::PreviewColors) -> Vec<PreviewElement> {
     let mut elements = Vec::new();
+    let mut descriptions = std::collections::HashMap::new();
     for (id, window, location) in state.layout.placements_with_ids().into_iter().rev() {
         let Some(surface) = window.wl_surface() else {
             continue;
@@ -94,6 +95,7 @@ fn preview_elements(state: &Lwfa, renderer: &mut GlesRenderer, fit: f64) -> Vec<
         trees.reverse();
         trees.push((surface.into_owned(), origin));
         for (surface, origin) in trees {
+            crate::color_render::descriptions(&surface, &mut descriptions);
             let tree: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 render_elements_from_surface_tree(
                     renderer,
@@ -105,10 +107,16 @@ fn preview_elements(state: &Lwfa, renderer: &mut GlesRenderer, fit: f64) -> Vec<
                 );
             elements.extend(
                 tree.into_iter()
-                    .filter_map(|element| project_element(element, scale, offset, crop)),
+                    .filter_map(|element| {
+                        let description = descriptions.get(element.id()).copied().unwrap_or_default();
+                        let element = colors.wrap(renderer, element, description, state.color_state.available)?;
+                        project_element(element, scale, offset, crop)
+                    }),
             );
         }
     }
+    colors.set_peak(descriptions.values().map(|d| d.target_peak/d.reference_white).fold(1.0_f32, f32::max));
+    colors.retain(&descriptions.keys().cloned().collect());
     elements
 }
 
@@ -246,7 +254,9 @@ pub fn init_winit(
             data.config.window.height,
         ))
         .with_visible(true);
-    let (backend, winit_source) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
+    let (mut backend, winit_source) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
+
+    crate::color_render::init_backend(data, backend.renderer());
 
     // Shared because two sources need it: the winit event source for the
     // on-screen path, and the stall timer for the remote one. They are both
@@ -274,6 +284,7 @@ pub fn init_winit(
     );
     let mut preview_size = backend.borrow().window_size();
     data.set_preview_size(preview_size);
+    let mut preview_colors = crate::color_render::PreviewColors::default();
     let mut damage_tracker = OutputDamageTracker::new(preview_size, 1.0, Transform::Flipped180);
     let apply_output_size = {
         let output = output.clone();
@@ -396,14 +407,12 @@ pub fn init_winit(
                                     return;
                                 }
                             };
-                            let elements = preview_elements(state, renderer, fit);
-                            if let Err(err) = damage_tracker.render_output(
-                                renderer,
-                                &mut framebuffer,
-                                0,
-                                &elements,
-                                backdrop,
-                            ) {
+                            let elements = preview_elements(state, renderer, fit, &mut preview_colors);
+                            if state.color_state.available {
+                                if let Err(err) = preview_colors.render(renderer, &mut framebuffer, &mut damage_tracker, &elements, preview_size, backdrop) {
+                                    tracing::error!("color preview failed: {err}");
+                                }
+                            } else if let Err(err) = damage_tracker.render_output(renderer, &mut framebuffer, 0, &elements, backdrop) {
                                 tracing::error!("render failed: {err}");
                             }
                         }

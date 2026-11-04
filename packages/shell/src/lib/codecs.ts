@@ -1,3 +1,4 @@
+import { supportsHdr, HDR_COLOR_SPACE } from "./hdr"
 /**
  * Asking the browser what it can actually decode.
  *
@@ -28,7 +29,7 @@
  */
 
 /** A codec the engine can encode and a browser might be able to decode. */
-export type Codec = "hevc" | "h264"
+export type Codec = "hevcHdr" | "hevc" | "h264"
 
 /**
  * In the order the engine should prefer them.
@@ -42,7 +43,7 @@ export type Codec = "hevc" | "h264"
  * Ada-generation card to encode, which this machine does not have. Worth
  * revisiting, not worth shipping.
  */
-export const PREFERENCE: readonly Codec[] = ["hevc", "h264"]
+export const PREFERENCE: readonly Codec[] = ["hevcHdr", "hevc", "h264"]
 
 /**
  * What to hand `isConfigSupported` for each family.
@@ -51,6 +52,7 @@ export const PREFERENCE: readonly Codec[] = ["hevc", "h264"]
  * strings, these levels accommodate the 1080p probe dimensions.
  */
 const PROBE: Record<Codec, string> = {
+  hevcHdr: "hvc1.2.4.L120.B0",
   hevc: "hvc1.1.6.L120.B0",
   h264: "avc1.4D0028",
 }
@@ -140,7 +142,8 @@ export async function decodable(): Promise<Codec[]> {
   const answers = await Promise.all(
     PREFERENCE.map(async (codec) => {
       try {
-        const support = await decoder.isConfigSupported({ codec: PROBE[codec], ...PROBE_SIZE })
+        if (codec === "hevcHdr" && !(await supportsHdr())) return null
+        const support = await decoder.isConfigSupported({ codec: PROBE[codec], ...PROBE_SIZE, ...(codec === "hevcHdr" ? { colorSpace: HDR_COLOR_SPACE } : {}) })
         return support.supported === true ? codec : null
       } catch {
         // A rejected promise means the configuration was not merely

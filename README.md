@@ -24,6 +24,9 @@ window, decoded with WebCodecs. Audio is Opus. Keyboard, mouse, touch and an
 on-screen gamepad the machine sees as a real controller all come back the other
 way.
 
+[Color management and HDR](docs/color-management.md) supports named Wayland
+source spaces, HEVC Main10/PQ for capable viewers, and SDR fallback.
+
 There is **nothing to install on the client**. It is a browser tab, or a home
 screen icon if you add it as a PWA.
 

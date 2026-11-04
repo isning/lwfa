@@ -423,7 +423,7 @@ export interface FileFilter {
  * Ordered best first in `PREFERENCE` on the shell side. HEVC is roughly a
  * third fewer bits than H.264 for the same picture.
  */
-export type Codec = "hevc" | "h264"
+export type Codec = "hevcHdr" | "hevc" | "h264"
 
 /**
  * What a connected session is allowed to do.
@@ -1728,7 +1728,7 @@ export function decodeToEngine(text: string): ToEngine {
         }),
         codecs: array(o, "codecs", where).map((c, i) => {
           const value = String(c)
-          if (value !== "hevc" && value !== "h264") {
+          if (value !== "hevcHdr" && value !== "hevc" && value !== "h264") {
             throw new ProtocolError(`${where}.codecs[${i}]: unknown codec ${value}`)
           }
           return value
@@ -1885,6 +1885,8 @@ export const FrameFormat = {
    *  H.264, roughly a third fewer bits, sent only where the client said it can
    *  decode it. */
   Hevc: 2,
+  /** HEVC Main10 BT.2020/PQ, limited range, requiring HDR presentation. */
+  HevcHdr: 3,
 } as const
 export type FrameFormat = (typeof FrameFormat)[keyof typeof FrameFormat]
 
@@ -2000,7 +2002,7 @@ export function decodeFrame(buffer: ArrayBuffer): DecodedFrame | null {
   if (view.getUint32(0, true) !== FRAME_MAGIC_LE) return null
   if (view.getUint8(4) !== FRAME_VERSION) return null
   const format = view.getUint8(5)
-  if (format !== FrameFormat.Jpeg && format !== FrameFormat.H264 && format !== FrameFormat.Hevc)
+  if (format !== FrameFormat.Jpeg && format !== FrameFormat.H264 && format !== FrameFormat.Hevc && format !== FrameFormat.HevcHdr)
     return null
   const keyframe = (view.getUint8(6) & FLAG_KEYFRAME) !== 0
 

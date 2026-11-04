@@ -9,6 +9,20 @@
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
+#ifdef LWFA_COLOR_TEST
+#include "color-management-v1-client-protocol.h"
+static struct wp_color_manager_v1 *color_manager;
+static struct wp_image_description_v1 *color_image;
+static struct wp_color_management_surface_v1 *color_surface;
+static int color_ready;
+static void ignored_uint(void *data, struct wp_color_manager_v1 *manager, uint32_t value) { (void)data; (void)manager; (void)value; }
+static void ignored_done(void *data, struct wp_color_manager_v1 *manager) { (void)data; (void)manager; }
+static const struct wp_color_manager_v1_listener color_listener = { .supported_intent = ignored_uint, .supported_feature = ignored_uint, .supported_tf_named = ignored_uint, .supported_primaries_named = ignored_uint, .done = ignored_done };
+static void image_ready(void *data, struct wp_image_description_v1 *image, uint32_t identity) { (void)data; (void)image; (void)identity; color_ready = 1; }
+static void image_failed(void *data, struct wp_image_description_v1 *image, uint32_t cause, const char *message) { (void)data; (void)image; (void)cause; fprintf(stderr, "%s\n", message); exit(8); }
+static const struct wp_image_description_v1_listener image_listener = { .ready = image_ready, .failed = image_failed };
+#endif
+
 #define WIDTH 320
 #define HEIGHT 240
 
@@ -53,7 +67,12 @@ static void draw(void) {
     if (!buffer) return;
     for (unsigned y = 0; y < HEIGHT; ++y) {
         for (unsigned x = 0; x < WIDTH; ++x) {
-            buffer->pixels[y * WIDTH + x] = 0xffcc3322;
+            buffer->pixels[y * WIDTH + x] =
+#ifdef LWFA_COLOR_TEST
+                (3u << 30) | (520u << 20) | (520u << 10) | 520u; /* 10-bit PQ approximately 100 cd/m². */
+#else
+                0xffcc3322;
+#endif
         }
     }
     /* Changing content proves frame callbacks keep the application advancing. */
@@ -97,6 +116,12 @@ static const struct xdg_wm_base_listener shell_listener = { .ping = ping };
 static void global(void *data, struct wl_registry *registry, uint32_t name,
                    const char *interface, uint32_t version) {
     (void)data; (void)version;
+#ifdef LWFA_COLOR_TEST
+    if (!strcmp(interface, "wp_color_manager_v1")) {
+        color_manager = wl_registry_bind(registry, name, &wp_color_manager_v1_interface, 1);
+        wp_color_manager_v1_add_listener(color_manager, &color_listener, NULL);
+    } else
+#endif
     if (!strcmp(interface, "wl_compositor")) {
         compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 1);
     } else if (!strcmp(interface, "wl_shm")) {
@@ -126,12 +151,54 @@ int main(void) {
         buffers[i].pixels = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (buffers[i].pixels == MAP_FAILED) return 4;
         struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
-        buffers[i].handle = wl_shm_pool_create_buffer(pool, 0, WIDTH, HEIGHT, WIDTH * 4, WL_SHM_FORMAT_XRGB8888);
+        buffers[i].handle = wl_shm_pool_create_buffer(pool, 0, WIDTH, HEIGHT, WIDTH * 4,
+#ifdef LWFA_COLOR_TEST
+            WL_SHM_FORMAT_XBGR2101010
+#else
+            WL_SHM_FORMAT_XRGB8888
+#endif
+        );
         wl_buffer_add_listener(buffers[i].handle, &buffer_listener, &buffers[i]);
         wl_shm_pool_destroy(pool);
         close(fd);
     }
     surface = wl_compositor_create_surface(compositor);
+#ifdef LWFA_COLOR_TEST
+    if (!color_manager) return 7;
+    struct wp_image_description_creator_params_v1 *params = wp_color_manager_v1_create_parametric_creator(color_manager);
+    const char *invalid = getenv("LWFA_TEST_COLOR_INVALID");
+    if (invalid) {
+        uint32_t expected = 0;
+        if (!strcmp(invalid, "mastering")) {
+            wp_image_description_creator_params_v1_set_mastering_luminance(params, 0, 1000);
+            expected = WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_UNSUPPORTED_FEATURE;
+        } else if (!strcmp(invalid, "duplicate")) {
+            wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+            wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+            expected = WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_ALREADY_SET;
+        } else {
+            wp_image_description_creator_params_v1_create(params);
+            expected = WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INCOMPLETE_SET;
+        }
+        int result = wl_display_roundtrip(display);
+        const struct wl_interface *interface = NULL;
+        uint32_t id = 0;
+        uint32_t error = wl_display_get_protocol_error(display, &interface, &id);
+        int correct_interface = interface ? !strcmp(interface->name, "wp_image_description_creator_params_v1") : !strcmp(invalid, "incomplete");
+        int passed = result < 0 && correct_interface && error == expected;
+        wl_display_disconnect(display);
+        return passed ? 0 : 10;
+    }
+    wp_image_description_creator_params_v1_set_primaries_named(params, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+    wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+    wp_image_description_creator_params_v1_set_max_cll(params, 1000);
+    color_image = wp_image_description_creator_params_v1_create(params);
+    wp_image_description_v1_add_listener(color_image, &image_listener, NULL);
+    while (!color_ready) if (wl_display_roundtrip(display) < 0) return 9;
+    color_surface = wp_color_manager_v1_get_surface(color_manager, surface);
+    wp_color_management_surface_v1_set_image_description(color_surface, color_image, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+    wp_image_description_v1_destroy(color_image); /* Copy semantics must preserve the surface state. */
+#endif
     struct xdg_surface *xdg = xdg_wm_base_get_xdg_surface(shell, surface);
     xdg_surface_add_listener(xdg, &surface_listener, NULL);
     struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(xdg);

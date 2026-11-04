@@ -294,6 +294,23 @@ pub fn wants_clip(stream: &TcpStream) -> bool {
 /// Errors are deliberately swallowed: this runs on a throwaway thread for one
 /// connection, and a client that hangs up mid-response is ordinary rather than
 /// notable. Anything worth knowing about is logged by the caller.
+pub fn wants_capabilities(stream: &TcpStream) -> bool {
+    peek_head_briefly(stream).and_then(|head| request_target(&head).map(str::to_owned))
+        .is_some_and(|target| target.split('?').next().unwrap_or("").ends_with("/capabilities.json"))
+}
+
+/// An additive feature probe keeps a new HDR shell compatible with an old
+/// strict v2 engine, which cannot parse an unknown codec name in SetStreams.
+pub fn serve_capabilities(mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+    let Some(head) = read_head(&mut stream) else { return; };
+    let Some((method, _)) = request_line(&head) else { return; };
+    let body = br#"{"codecs":["hevcHdr","hevc","h264"]}"#;
+    let status = if method == "GET" || method == "HEAD" { 200 } else { 405 };
+    let _ = respond(&mut stream, status, "application/json", body, Some("no-store"), method == "GET");
+}
+
 pub fn serve(mut stream: TcpStream, root: &Path) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));

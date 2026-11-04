@@ -149,6 +149,7 @@ pub struct Lwfa {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
+    pub color_state: crate::color_management::ColorState,
 
     /// Smithay's 2D plane. The layout decides positions; the space holds what
     /// was decided so rendering and hit-testing can use it.
@@ -440,6 +441,7 @@ impl Lwfa {
             primary: None,
             accounts: None,
             capture: SurfaceCapture::default(),
+            color_state: Default::default(),
             encoders: None,
             streaming: std::collections::HashSet::new(),
             capture_pacing: std::collections::HashMap::new(),
@@ -1089,7 +1091,9 @@ impl Lwfa {
             .filter(|s| s.video)
             .filter_map(|s| s.codecs.as_deref())
             .collect();
-        lwfa_proto::Codec::best_for_all(answered)
+        let answered: Vec<Vec<_>> = answered.into_iter().map(|codecs| codecs.iter().copied()
+            .filter(|codec| *codec != lwfa_proto::Codec::HevcHdr || self.color_state.available).collect()).collect();
+        lwfa_proto::Codec::best_for_all(answered.iter().map(Vec::as_slice))
     }
 
     /// Broadcast the primary's arrangement to everyone following it.

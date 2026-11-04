@@ -805,3 +805,6 @@ and without that the shell would ask again on every reload forever.
 | GNOME Shell | Precedent for a scripted shell on a native compositor. |
 | [niri](https://github.com/niri-wm/niri) | The layout model (section 2.3), and the closest reference for a Smithay compositor in production. GPL-3.0, so read but do not copy without a license decision. |
 | GNOME PaperWM | Where scrollable tiling came from. |
+
+See [color management and HDR](color-management.md) for named source spaces,
+Main10/PQ streaming, viewer requirements and color-specific verification.

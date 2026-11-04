@@ -1,3 +1,4 @@
+import type { DrawableFrame } from "./hdr"
 /**
  * Decoded frames, stored per window and subscribed to per window.
  *
@@ -23,7 +24,7 @@
 import { useCallback, useSyncExternalStore } from "react"
 import type { WindowId } from "@lwfa/proto"
 
-const frames = new Map<WindowId, ImageBitmap>()
+const frames = new Map<WindowId, DrawableFrame>()
 const listeners = new Map<WindowId, Set<() => void>>()
 
 function notify(id: WindowId): void {
@@ -33,7 +34,7 @@ function notify(id: WindowId): void {
 }
 
 /** Store a newly decoded frame, closing the one it replaces. */
-export function publishFrame(id: WindowId, bitmap: ImageBitmap): void {
+export function publishFrame(id: WindowId, bitmap: DrawableFrame): void {
   frames.get(id)?.close()
   frames.set(id, bitmap)
   notify(id)
@@ -68,7 +69,7 @@ export function clearFrames(): void {
  * whenever `subscribe` changes identity, so building it inline would tear down
  * and rebuild the subscription on every single render.
  */
-export function useFrame(id: WindowId): ImageBitmap | null {
+export function useFrame(id: WindowId): DrawableFrame | null {
   const subscribe = useCallback(
     (listener: () => void) => {
       let set = listeners.get(id)

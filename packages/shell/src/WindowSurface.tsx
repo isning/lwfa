@@ -1,3 +1,4 @@
+import { drawHdr } from "@/lib/hdr"
 /**
  * One live window, composited in the DOM.
  *
@@ -269,6 +270,8 @@ export const WindowSurface = memo(function WindowSurface({
       el.width = frame.width
       el.height = frame.height
     }
+
+    if ("hdr" in frame) { drawHdr(el, frame); return }
 
     // Looked up once per canvas, not per frame. The browser caches the
     // context internally, but the lookup plus its options object were still
@@ -565,7 +568,7 @@ export const WindowSurface = memo(function WindowSurface({
         event.preventDefault()
       }}
     >
-      <canvas ref={canvas} className="block h-full w-full" />
+      <canvas key={frame && "hdr" in frame ? "hdr" : "sdr"} ref={canvas} className="block h-full w-full" />
       {/*
         * No "paused" badge for unfocused windows on purpose. With
         * pause-inactive on, a frozen side window is the normal state of the

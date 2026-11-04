@@ -201,6 +201,7 @@ struct Slot {
     /// Read on the encoder thread, to decide who a finished frame goes to.
     /// Written on the compositor thread when a client sends `SetStreams`.
     streams: Mutex<HashSet<WindowId>>,
+    hdr: AtomicBool,
     /// Whether this client has asked to hear the machine.
     ///
     /// Read on the capture thread, written on the compositor thread, same as
@@ -370,6 +371,10 @@ impl Clients {
             slot.audio.store(enabled, Ordering::Relaxed);
             slot.opus.store(opus, Ordering::Relaxed);
         });
+    }
+
+    pub fn set_hdr(&self, id: SessionId, hdr: bool) {
+        self.with(id, |slot| slot.hdr.store(hdr, Ordering::Relaxed));
     }
 
     /// Record what one client wants. Total, matching `SetStreams`.
@@ -595,6 +600,9 @@ impl FrameSink {
         let max_bytes = self.clients.queue_bytes();
         let size = bytes.len();
         for slot in slots.iter() {
+            // A rendition may finish after a new SDR viewer subscribes. Never
+            // fan an in-flight HDR frame out to a viewer that did not opt in.
+            if bytes.get(5) == Some(&(lwfa_proto::FrameFormat::HevcHdr as u8)) && !slot.hdr.load(Ordering::Relaxed) { continue; }
             if !slot.has_room(max, max_bytes) {
                 continue;
             }
@@ -1110,6 +1118,11 @@ fn accept_loop(
                         continue;
                     }
 
+                    if crate::http::wants_capabilities(&stream) {
+                        let _ = thread::Builder::new().name("lwfa-capabilities".into())
+                            .spawn(move || crate::http::serve_capabilities(stream));
+                        continue;
+                    }
                     if !crate::http::wants_websocket(&stream) {
                         match shell_dir.as_deref() {
                             Some(root) => {
@@ -1186,6 +1199,7 @@ fn accept_loop(
                         audio_in_flight: Arc::clone(&audio_in_flight),
                         connected: Arc::clone(&connected),
                         streams: Mutex::new(HashSet::new()),
+                        hdr: AtomicBool::new(false),
                         audio: AtomicBool::new(false),
                         opus: AtomicBool::new(false),
                         rtt_excess: Arc::clone(&rtt_excess),
@@ -2090,6 +2104,24 @@ pub(crate) mod tests {
         (ShellLink { clients }, drain)
     }
 
+    #[test]
+    fn an_inflight_hdr_rendition_is_not_sent_to_a_new_sdr_viewer() {
+        let wake = rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap();
+        let clients = Arc::new(Clients::new(4,wake));
+        let (hdr_tx,hdr_rx) = channel();
+        let (sdr_tx,sdr_rx) = channel();
+        clients.add(Arc::new(Slot { id: 1, outgoing: hdr_tx, ..test_slot() }));
+        clients.add(Arc::new(Slot { id: 2, outgoing: sdr_tx, ..test_slot() }));
+        clients.set_streams(1, [WindowId(1)].into_iter().collect());
+        clients.set_streams(2, [WindowId(1)].into_iter().collect());
+        clients.set_hdr(1,true);
+        let bytes = lwfa_proto::FrameHeader { window: WindowId(1), width: 320, height: 240,
+            format: lwfa_proto::FrameFormat::HevcHdr, keyframe: true }.encode_with_payload(&[1,2,3]);
+        FrameSink { clients }.send_frame(WindowId(1),bytes);
+        assert!(matches!(hdr_rx.try_recv(),Ok(Outgoing::Frame(_))));
+        assert!(sdr_rx.try_recv().is_err());
+    }
+
     fn test_slot() -> Slot {
         let (outgoing, _rx) = channel::<Outgoing>();
         Slot {
@@ -2100,6 +2132,7 @@ pub(crate) mod tests {
             audio_in_flight: Arc::new(AtomicUsize::new(0)),
             connected: Arc::new(AtomicBool::new(true)),
             streams: Mutex::new(HashSet::new()),
+            hdr: AtomicBool::new(false),
             audio: AtomicBool::new(false),
             opus: AtomicBool::new(false),
             rtt_excess: Arc::new(AtomicU64::new(RTT_UNMEASURED)),

@@ -73,6 +73,8 @@ export function formatNow(): FrameFormat | null {
  */
 export function describeFormat(format: FrameFormat | null): string {
   switch (format) {
+    case FrameFormat.HevcHdr:
+      return "HEVC HDR10"
     case FrameFormat.Hevc:
       return "HEVC"
     case FrameFormat.H264:

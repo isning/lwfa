@@ -89,3 +89,6 @@ disconnect, and reconnection to the same window. It retains logs and images in
 a new artifact directory. `LWFA_TEST_DISCONNECT_MS` can shorten the interval for
 iteration; values below 45000 do not cover the session grace period. This is a
 protocol client test, not browser WebCodecs or hardware encoder validation.
+
+See [color management and HDR](color-management.md) for named source spaces,
+Main10/PQ streaming, viewer requirements and color-specific verification.

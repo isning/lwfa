@@ -705,13 +705,15 @@ pub struct FileFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Codec {
+    /// HEVC Main10, BT.2020/PQ; requires HDR presentation as well as decoding.
+    HevcHdr,
     Hevc,
     H264,
 }
 
 impl Codec {
     /// Best first. The order is the preference.
-    pub const ALL: [Codec; 2] = [Codec::Hevc, Codec::H264];
+    pub const ALL: [Codec; 3] = [Codec::HevcHdr, Codec::Hevc, Codec::H264];
 
     /// The best codec every one of these clients can decode.
     ///
@@ -1709,6 +1711,8 @@ pub enum FrameFormat {
     /// the desktop is usable. Sent only to clients that have said they can
     /// decode it; see [`Codec`].
     Hevc = 2,
+    /// HEVC Main10 with BT.2020 primaries, PQ transfer and limited-range YUV.
+    HevcHdr = 3,
 }
 
 impl FrameFormat {
@@ -1717,6 +1721,7 @@ impl FrameFormat {
             0 => Some(Self::Jpeg),
             1 => Some(Self::H264),
             2 => Some(Self::Hevc),
+            3 => Some(Self::HevcHdr),
             _ => None,
         }
     }

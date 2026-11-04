@@ -1,3 +1,4 @@
+import { HDR_CHANGED } from "@/lib/hdr";
 /**
  * The shell.
  *
@@ -306,14 +307,24 @@ export function App(): React.ReactElement {
   const failedCodecs = useRef(new Set<Codec>());
   useEffect(() => {
     let live = true;
-    void decodable().then((codecs) => {
-      if (live) {
-        availableCodecs.current = codecs;
-        setDecodes(codecs.filter((codec) => !failedCodecs.current.has(codec)));
-      }
-    });
+    let generation = 0;
+    const refresh = () => {
+      const current = ++generation;
+      void decodable().then((codecs) => {
+        if (live && generation === current) {
+          availableCodecs.current = codecs;
+          setDecodes(codecs.filter((codec) => !failedCodecs.current.has(codec)));
+        }
+      });
+    };
+    const display = window.matchMedia("(dynamic-range: high)");
+    display.addEventListener("change", refresh);
+    window.addEventListener(HDR_CHANGED, refresh);
+    refresh();
     return () => {
       live = false;
+      display.removeEventListener("change", refresh);
+      window.removeEventListener(HDR_CHANGED, refresh);
     };
   }, []);
 

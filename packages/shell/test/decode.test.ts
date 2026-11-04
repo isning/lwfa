@@ -539,3 +539,14 @@ describe("actual stream capability and fallback", () => {
     expect(stats.constructed).toBe(2)
   })
 })
+
+it("HDR frame wrappers report closed dimensions and release their VideoFrame", async () => {
+  const { hdrFrame } = await import("../src/lib/hdr")
+  let closed = false
+  const video = { get displayWidth() { return closed ? 0 : 32 }, get displayHeight() { return closed ? 0 : 24 }, close() { closed = true } } as VideoFrame
+  const frame = hdrFrame(video)
+  expect(frame.width).toBe(32)
+  frame.close()
+  expect(frame.width).toBe(0)
+  expect(frame.height).toBe(0)
+})

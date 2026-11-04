@@ -1,3 +1,4 @@
+import { HDR_COLOR_SPACE, hdrFrame, type DrawableFrame } from "@/lib/hdr"
 /**
  * Frame decoding for the remote backend.
  *
@@ -37,7 +38,7 @@ export function supportsH264(): boolean {
   return typeof globalThis.VideoDecoder !== "undefined"
 }
 
-export type FrameSink = (window: WindowId, bitmap: ImageBitmap) => void
+export type FrameSink = (window: WindowId, bitmap: DrawableFrame) => void
 
 /**
  * Owns one decoder per window and turns wire frames into drawable bitmaps.
@@ -120,7 +121,7 @@ export class FrameDecoder {
 
   #handleVideo(frame: DecodedFrame): void {
     const { window: id, width, height, keyframe } = frame.header
-    const family: Codec = frame.header.format === FrameFormat.Hevc ? "hevc" : "h264"
+    const family: Codec = frame.header.format === FrameFormat.HevcHdr ? "hevcHdr" : frame.header.format === FrameFormat.Hevc ? "hevc" : "h264"
     if (this.#failed.has(family)) return
 
     if (!supportsH264()) {
@@ -142,7 +143,7 @@ export class FrameDecoder {
       this.#reset(id)
       return
     }
-    const config = codec ? { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true } : null
+    const config: VideoDecoderConfig | null = codec ? { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true, ...(family === "hevcHdr" ? { colorSpace: HDR_COLOR_SPACE } : {}) } : null
     const wanted = codec ? `${width}x${height}:${codec}` : null
 
     let decoder = this.#decoders.get(id)
@@ -222,6 +223,10 @@ export class FrameDecoder {
             const deliver = this.#deliveryFor(id)
             // Conversion copies the pixels asynchronously. Keep the VideoFrame
             // alive until it completes, then release its decoder buffer.
+            if (this.#families.get(id) === "hevcHdr") {
+              deliver(hdrFrame(videoFrame))
+              return
+            }
             createImageBitmap(videoFrame)
               .then(deliver)
               .catch((err) => console.warn(`could not convert a frame for w${id}:`, err))
@@ -336,7 +341,7 @@ export class FrameDecoder {
     this.#onUnsupported(family, `Window ${id}${size}: ${message}`)
   }
 
-  #deliveryFor(id: WindowId): (bitmap: ImageBitmap) => void {
+  #deliveryFor(id: WindowId): (bitmap: DrawableFrame) => void {
     let lifetime = this.#delivery.get(id)
     if (!lifetime) {
       lifetime = { issued: 0, published: 0 }

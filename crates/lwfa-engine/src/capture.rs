@@ -56,7 +56,7 @@ use smithay::wayland::seat::WaylandFocus;
 
 /// A captured window image.
 ///
-/// The pixels sit in a pooled ffmpeg frame from the moment they leave the GPU,
+/// SDR pixels sit in a pooled ffmpeg frame from the moment they leave the GPU,
 /// so the encoder receives them without another copy. The bytes are RGBA in
 /// memory; the frame is labelled `RGB0`, which tells NVENC to read them as
 /// written and ignore the fourth byte. The alpha survives in the data itself,
@@ -64,11 +64,15 @@ use smithay::wayland::seat::WaylandFocus;
 ///
 /// The data is *strided*: ffmpeg aligns rows, so a row occupies
 /// `frame.stride(0)` bytes of which the first `width * 4` are pixels.
+/// HDR frames instead own a CPU P010 frame with BT.2020/PQ samples.
 pub struct CapturedFrame {
     pub id: WindowId,
     pub width: u32,
     pub height: u32,
     pub frame: PooledFrame,
+    pub hdr: bool,
+    pub hdr_peak: f32,
+    pub color_generation: u64,
 }
 
 /// Reusable ffmpeg frames, shared by the capture and encoder threads.
@@ -142,8 +146,8 @@ pub struct PooledFrame {
 }
 
 impl PooledFrame {
-    /// Wrap a GPU frame. See [`crate::cuda`].
-    fn gpu(frame: ff::frame::Video) -> Self {
+    /// Own a frame that does not belong to the reusable 8-bit CPU pool.
+    pub(crate) fn owned(frame: ff::frame::Video) -> Self {
         Self {
             frame: Some(frame),
             pool: None,
@@ -207,6 +211,11 @@ fn take_pending<M>(
 
 struct Target {
     texture: GlesTexture,
+    linear: Option<GlesTexture>,
+    hdr: bool,
+    hdr_peak: f32,
+    color_generation: u64,
+    colors: HashMap<smithay::backend::renderer::element::Id, crate::color::Description>,
     density: f64,
     size: Size<i32, Physical>,
     /// Commit counters of every element captured last time.
@@ -286,6 +295,9 @@ impl CaptureDiagnostics {
 }
 
 pub struct SurfaceCapture {
+    hdr: bool,
+    color_generation: u64,
+    color_program: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     targets: HashMap<WindowId, Target>,
     pool: Arc<FramePool>,
     diagnostics: HashMap<WindowId, CaptureDiagnostics>,
@@ -294,6 +306,9 @@ pub struct SurfaceCapture {
 impl Default for SurfaceCapture {
     fn default() -> Self {
         Self {
+            hdr: false,
+            color_generation: 0,
+            color_program: None,
             targets: HashMap::new(),
             pool: FramePool::new(),
             diagnostics: HashMap::new(),
@@ -302,6 +317,11 @@ impl Default for SurfaceCapture {
 }
 
 impl SurfaceCapture {
+    pub fn enable_color(&mut self, program: smithay::backend::renderer::gles::GlesTexProgram) { self.color_program = Some(program); }
+    pub fn set_hdr(&mut self, hdr: bool) {
+        if self.hdr != hdr { self.hdr = hdr; self.targets.clear(); }
+    }
+
     pub fn forget(&mut self, id: WindowId) {
         self.targets.remove(&id);
         self.diagnostics.remove(&id);
@@ -441,8 +461,14 @@ impl SurfaceCapture {
 
         // The one CPU copy on the whole path: out of the mapped pixel buffer,
         // straight into the frame the encoder will read.
-        let mut frame = self.pool.get(width, height);
-        copy_rows(&bytes[..expected], &mut frame, width, height);
+        let hdr = target.hdr;
+        let frame = if hdr {
+            PooledFrame::owned(crate::color::p010_from_rgb10(&bytes[..expected], width, height))
+        } else {
+            let mut frame = self.pool.get(width, height);
+            copy_rows(&bytes[..expected], &mut frame, width, height);
+            frame
+        };
         if let Some(diagnostics) = self.diagnostics.get_mut(&id) {
             diagnostics.counts.cpu_copies += 1;
             diagnostics.counts.cpu_copy_bytes += expected as u64;
@@ -453,6 +479,9 @@ impl SurfaceCapture {
             width,
             height,
             frame,
+            hdr,
+            hdr_peak: target.hdr_peak,
+            color_generation: target.color_generation,
         })
     }
 
@@ -537,8 +566,16 @@ impl SurfaceCapture {
 
         // Recreate the buffer when the window resizes; reuse it otherwise, so
         // the steady state allocates nothing.
+        let mut colors = HashMap::new();
+        crate::color_render::descriptions(&surface, &mut colors);
+        for (overlay, _) in overlays { crate::color_render::descriptions(overlay, &mut colors); }
+        let managed = self.hdr || colors.values().any(|color| *color != crate::color::Description::default());
+        if managed && self.color_program.is_none() {
+            self.color_program = Some(crate::color_render::program(renderer)
+                .inspect_err(|err| tracing::warn!("color shader unavailable: {err}")).ok()?);
+        }
         let needs_new_buffer = match self.targets.get(&id) {
-            Some(target) => target.size != size,
+            Some(target) => target.size != size || target.hdr != self.hdr || target.linear.is_some() != managed,
             None => true,
         };
 
@@ -546,7 +583,7 @@ impl SurfaceCapture {
             && self
                 .targets
                 .get(&id)
-                .is_some_and(|t| t.last_commits == commits)
+                .is_some_and(|t| t.last_commits == commits && t.colors == colors)
         {
             // Unchanged. Skipping everything below here is what makes
             // capturing many windows affordable.
@@ -581,7 +618,7 @@ impl SurfaceCapture {
 
         if needs_new_buffer {
             let Ok(texture) = renderer
-                .create_buffer(Fourcc::Abgr8888, buffer_size(size))
+                .create_buffer(if self.hdr { Fourcc::Abgr2101010 } else { Fourcc::Abgr8888 }, buffer_size(size))
                 .inspect_err(|err| {
                     tracing::warn!("could not create a capture buffer for {id}: {err}")
                 })
@@ -592,6 +629,11 @@ impl SurfaceCapture {
                 id,
                 Target {
                     texture,
+                    linear: if managed { Some(renderer.create_buffer(Fourcc::Abgr16161616f, buffer_size(size)).inspect_err(|err| tracing::warn!("linear color buffer unavailable: {err}")).ok()?) } else { None },
+                    hdr: self.hdr,
+                    hdr_peak: 203.0,
+                    colors: HashMap::new(),
+                    color_generation: 0,
                     density,
                     size,
                     last_commits: Vec::new(),
@@ -603,10 +645,16 @@ impl SurfaceCapture {
 
         let target = self.targets.get_mut(&id)?;
         target.last_commits = commits;
+        if target.colors != colors {
+            self.color_generation = self.color_generation.wrapping_add(1);
+            target.color_generation = self.color_generation;
+        }
+        target.hdr_peak = 203.0 * colors.values().map(|color| color.target_peak/color.reference_white).fold(1.0_f32, f32::max);
+        target.colors = colors;
 
         let whole = Rectangle::from_size(size);
         let Ok(mut framebuffer) = renderer
-            .bind(&mut target.texture)
+            .bind(target.linear.as_mut().unwrap_or(&mut target.texture))
             .inspect_err(|err| tracing::warn!("could not bind capture buffer for {id}: {err}"))
         else {
             return None;
@@ -635,6 +683,10 @@ impl SurfaceCapture {
                 // shadow. Using `whole` here would move the damaged area with
                 // that offset and leave the right/bottom edges undrawn.
                 let damage = Rectangle::from_size(dst.size);
+                if managed {
+                    let color = target.colors.get(element.id()).copied().unwrap_or_default();
+                    frame.override_default_tex_program(self.color_program.as_ref()?.clone(), crate::color_render::uniforms(color, 0.0));
+                }
                 if let Err(err) = RenderElement::draw(element, &mut frame, src, dst, &[damage], &[])
                 {
                     tracing::warn!("capture draw failed for {id}: {err}");
@@ -653,6 +705,16 @@ impl SurfaceCapture {
             }
         }
         drop(framebuffer);
+        if let Some(linear) = target.linear.as_ref() {
+            let mut framebuffer = renderer.bind(&mut target.texture).ok()?;
+            let mut frame = renderer.render(&mut framebuffer, size, Transform::Normal).ok()?;
+            frame.clear(Color32F::TRANSPARENT, &[whole]).ok()?;
+            let peak = target.colors.values().map(|color| color.target_peak / color.reference_white).fold(1.0_f32, f32::max);
+            let resolve = crate::color::Description { reference_white: 80.0, target_peak: peak * 80.0, ..Default::default() };
+            frame.override_default_tex_program(self.color_program.as_ref()?.clone(), crate::color_render::uniforms(resolve, if self.hdr { 2.0 } else { 1.0 }));
+            Frame::render_texture_from_to(&mut frame, linear, Rectangle::from_size(buffer_size(size)).to_f64(), whole, &[whole], &[], Transform::Normal, 1.0).ok()?;
+            let _fence = frame.finish().ok()?;
+        }
         let counts = &mut self
             .diagnostics
             .entry(id)
@@ -663,7 +725,7 @@ impl SurfaceCapture {
         // The zero-copy path: hand the rendered texture to CUDA and return
         // the frame now. If the bridge cannot be built or fails, fall through
         // to the read-back below, which owes nothing to any driver.
-        if gpu_direct && crate::cuda::available() {
+        if !self.hdr && gpu_direct && crate::cuda::available() {
             let width = size.w as u32;
             let height = size.h as u32;
             let tex = target.texture.tex_id();
@@ -676,7 +738,10 @@ impl SurfaceCapture {
                     id,
                     width,
                     height,
-                    frame: PooledFrame::gpu(frame),
+                    frame: PooledFrame::owned(frame),
+                    hdr: false,
+                    hdr_peak: target.hdr_peak,
+                    color_generation: target.color_generation,
                 });
             }
             target.gpu = None;
@@ -695,7 +760,7 @@ impl SurfaceCapture {
             .copy_framebuffer(
                 &framebuffer,
                 Rectangle::from_size(buffer_size(size)),
-                Fourcc::Abgr8888,
+                if self.hdr { Fourcc::Abgr2101010 } else { Fourcc::Abgr8888 },
             )
             .inspect_err(|err| tracing::warn!("could not copy capture buffer for {id}: {err}"))
         else {
@@ -863,6 +928,9 @@ impl CapturedFrame {
             width,
             height,
             frame,
+            hdr: false,
+            hdr_peak: 203.0,
+            color_generation: 0,
         }
     }
 
@@ -881,6 +949,7 @@ impl CapturedFrame {
 
     /// The pixels, tightly packed RGBA. A copy; for the fallback paths only.
     pub fn packed_rgba(&self) -> Option<Vec<u8>> {
+        if self.hdr { return Some(crate::color::p010_to_srgb(&self.frame, self.hdr_peak)); }
         let frame = self.cpu_pixels()?;
         let mut out = Vec::with_capacity(self.width as usize * self.height as usize * 4);
         for row in rows(&frame, self.width, self.height) {
@@ -897,9 +966,9 @@ impl CapturedFrame {
     pub fn to_jpeg(&self, quality: u8) -> Option<Vec<u8>> {
         use image::codecs::jpeg::JpegEncoder;
 
-        let frame = self.cpu_pixels()?;
+        let rgba = self.packed_rgba()?;
         let mut rgb = Vec::with_capacity(self.width as usize * self.height as usize * 3);
-        for row in rows(&frame, self.width, self.height) {
+        for row in rgba.chunks_exact(self.width as usize * 4) {
             for px in row.chunks_exact(4) {
                 rgb.extend_from_slice(&px[..3]);
             }
