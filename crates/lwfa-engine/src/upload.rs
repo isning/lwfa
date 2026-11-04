@@ -140,6 +140,17 @@ fn handshake(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
+    let (socket, request, cancelled) = accept_upload(stream, gates)?;
+    let _ = socket.get_ref().set_read_timeout(Some(READ_TIMEOUT));
+    Some((socket, request, cancelled))
+}
+
+#[allow(clippy::result_large_err)]
+fn accept_upload<S: Read + Write>(
+    stream: S,
+    gates: &Gates,
+) -> Option<(tungstenite::WebSocket<S>, u64, Arc<AtomicBool>)> {
+
     let mut admitted: Option<(u64, Arc<AtomicBool>)> = None;
     let accepted = tungstenite::accept_hdr(
         stream,
@@ -178,12 +189,20 @@ fn handshake(
     let socket = match accepted {
         Ok(socket) => socket,
         Err(err) => {
-            // Expected whenever a stale dialog's shell reconnects late.
+            // The error may retain the callback borrowing `admitted`.
             tracing::debug!("rejected an upload connection: {err}");
+            drop(err);
+            if let Some((request, cancelled)) = admitted
+                && let Some(gate) = gates.lock().unwrap().get_mut(&request)
+                && Arc::ptr_eq(&gate.cancelled, &cancelled)
+            {
+                // Admission precedes writing the upgrade response. A failed
+                // write must not leave this dialog's ticket occupied.
+                gate.attached = false;
+            }
             return None;
         }
     };
-    let _ = socket.get_ref().set_read_timeout(Some(READ_TIMEOUT));
     let (request, cancelled) = admitted?;
     Some((socket, request, cancelled))
 }
@@ -651,6 +670,72 @@ fn free_space(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HandshakeStream {
+        request: std::io::Cursor<Vec<u8>>,
+        fail_write: bool,
+    }
+
+    impl HandshakeStream {
+        fn new(fail_write: bool) -> Self {
+            Self {
+                request: std::io::Cursor::new(
+                    b"GET /upload?request=7&ticket=test-ticket HTTP/1.1\r\n\
+                      Host: localhost\r\n\
+                      Connection: Upgrade\r\n\
+                      Upgrade: websocket\r\n\
+                      Sec-WebSocket-Version: 13\r\n\
+                      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".to_vec(),
+                ),
+                fail_write,
+            }
+        }
+    }
+
+    impl Read for HandshakeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.request.read(buf)
+        }
+    }
+
+    impl Write for HandshakeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn upload_gates() -> Gates {
+        Arc::new(Mutex::new(HashMap::from([(
+            7,
+            Gate {
+                ticket: "test-ticket".into(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                partial_dir: PathBuf::new(),
+                roots: HashMap::new(),
+                attached: false,
+            },
+        )])))
+    }
+
+    #[test]
+    fn failed_handshake_releases_ticket_for_retry() {
+        let gates = upload_gates();
+        assert!(accept_upload(HandshakeStream::new(true), &gates).is_none());
+        assert!(!gates.lock().unwrap()[&7].attached);
+        assert!(accept_upload(HandshakeStream::new(false), &gates).is_some());
+        assert!(gates.lock().unwrap()[&7].attached);
+        // The successful connection still owns the ticket.
+        assert!(accept_upload(HandshakeStream::new(false), &gates).is_none());
+        assert!(gates.lock().unwrap()[&7].attached);
+    }
 
     #[test]
     fn traversal_becomes_a_filename_or_nothing() {
