@@ -174,9 +174,25 @@ impl Lwfa {
     /// wrong. See [`Lwfa::release_keys_for`].
     pub fn remote_key(&mut self, session: lwfa_proto::SessionId, key: KeyCode, pressed: bool) {
         if pressed {
-            self.held_keys.entry(session).or_default().insert(key);
-        } else if let Some(held) = self.held_keys.get_mut(&session) {
-            held.remove(&key);
+            if !self.held_keys.entry(session).or_default().insert(key) {
+                return;
+            }
+        } else {
+            let Some(held) = self.held_keys.get_mut(&session) else {
+                return;
+            };
+            if !held.remove(&key) {
+                return;
+            }
+        }
+        // All remote keyboards share one seat. Keep a key down until its
+        // last owning connection releases it.
+        if self
+            .held_keys
+            .iter()
+            .any(|(owner, held)| *owner != session && held.contains(&key))
+        {
+            return;
         }
         self.send_key(key, pressed);
     }
@@ -199,7 +215,9 @@ impl Lwfa {
             held.len()
         );
         for key in held {
-            self.send_key(key, false);
+            if !self.held_keys.values().any(|held| held.contains(&key)) {
+                self.send_key(key, false);
+            }
         }
     }
 
@@ -304,5 +322,53 @@ impl Lwfa {
     /// those come from a different clock and would jump.
     fn millis(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::reexports::calloop::EventLoop;
+
+    fn state() -> (EventLoop<'static, Lwfa>, Lwfa) {
+        let mut event_loop = EventLoop::try_new().unwrap();
+        let display = smithay::reexports::wayland_server::Display::new().unwrap();
+        let state = Lwfa::without_listener(&mut event_loop, display);
+        (event_loop, state)
+    }
+
+    #[test]
+    fn a_key_stays_pressed_until_its_last_holder_releases_it() {
+        let (_event_loop, mut state) = state();
+        let keyboard = state.seat.get_keyboard().unwrap();
+        state.remote_key(1, 42, true);
+        state.remote_key(2, 42, true);
+        state.remote_key(1, 42, false);
+        assert_eq!(keyboard.pressed_keys(), [Keycode::from(50u32)].into());
+        state.remote_key(2, 42, false);
+        assert!(keyboard.pressed_keys().is_empty());
+    }
+
+    #[test]
+    fn disconnect_does_not_release_a_peers_key() {
+        let (_event_loop, mut state) = state();
+        let keyboard = state.seat.get_keyboard().unwrap();
+        state.remote_key(1, 42, true);
+        state.remote_key(2, 42, true);
+        state.release_keys_for(1);
+        assert_eq!(keyboard.pressed_keys(), [Keycode::from(50u32)].into());
+        state.release_keys_for(2);
+        assert!(keyboard.pressed_keys().is_empty());
+    }
+
+    #[test]
+    fn a_connection_cannot_release_a_key_it_did_not_press() {
+        let (_event_loop, mut state) = state();
+        let keyboard = state.seat.get_keyboard().unwrap();
+        state.remote_key(1, 42, true);
+        state.remote_key(2, 42, false);
+        assert_eq!(keyboard.pressed_keys(), [Keycode::from(50u32)].into());
+        state.remote_key(1, 42, false);
+        assert!(keyboard.pressed_keys().is_empty());
     }
 }
