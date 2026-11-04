@@ -256,6 +256,13 @@ pub struct Lwfa {
     /// Keys each session currently holds, so they can be let go if it dies.
     /// See `Lwfa::remote_key`.
     pub held_keys: std::collections::HashMap<lwfa_proto::SessionId, std::collections::HashSet<u32>>,
+    /// Remote buttons are shared by the seat but owned by each connection.
+    pub(crate) held_buttons:
+        std::collections::HashMap<lwfa_proto::SessionId, std::collections::HashSet<u32>>,
+    /// The host preview shares the same pointer as remote connections.
+    pub(crate) local_buttons: std::collections::HashSet<u32>,
+    /// Browser contact ids are local to each connection, unlike seat slots.
+    pub(crate) touch_slots: std::collections::HashMap<(lwfa_proto::SessionId, i32), u32>,
     /// The file-chooser portal plumbing, when it came up. See `portal.rs`.
     pub portal: Option<crate::portal::Portal>,
     /// Open file dialogs, by the request id the shell echoes back.
@@ -444,6 +451,9 @@ impl Lwfa {
             xfocus: None,
             x11_initial_state: None,
             held_keys: std::collections::HashMap::new(),
+            held_buttons: std::collections::HashMap::new(),
+            local_buttons: std::collections::HashSet::new(),
+            touch_slots: std::collections::HashMap::new(),
             portal: None,
             pending_files: std::collections::HashMap::new(),
             next_file_request: 1,

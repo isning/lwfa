@@ -217,6 +217,27 @@ fn split_command_line(line: &str) -> Vec<String> {
 }
 
 impl Lwfa {
+    /// Arbitrate the host preview's buttons with remote holders of the seat.
+    pub(crate) fn preview_button(&mut self, event: ButtonEvent) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let changed = match event.state {
+            ButtonState::Pressed => self.local_buttons.insert(event.button),
+            ButtonState::Released => self.local_buttons.remove(&event.button),
+        };
+        if !changed
+            || self
+                .held_buttons
+                .values()
+                .any(|held| held.contains(&event.button))
+        {
+            return;
+        }
+        pointer.button(self, &event);
+        pointer.frame(self);
+    }
+
     fn preview_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
@@ -791,16 +812,12 @@ impl Lwfa {
                 }
 
                 let serial = SERIAL_COUNTER.next_serial();
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: button_state,
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                self.preview_button(ButtonEvent {
+                    button: event.button_code(),
+                    state: button_state,
+                    serial,
+                    time: event.time_msec(),
+                });
                 if button_state == ButtonState::Released && !pointer.is_grabbed() {
                     let position = self
                         .seat
