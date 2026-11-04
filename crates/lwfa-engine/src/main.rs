@@ -1367,6 +1367,12 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
             // downgraded to watching would keep a live ticket and go on
             // reading everything the owner copies.
             if downgraded {
+                // Releases from a viewer are rejected by the input gate, so
+                // neutralize held input before waiting for another message.
+                state.release_keys_for(target);
+                if let Some(pad) = state.gamepads.get(&target) {
+                    pad.neutral();
+                }
                 state.clip_close(target);
             } else {
                 state.clip_open(target);
@@ -1828,6 +1834,77 @@ mod tests {
             false,
             &ToEngine::CloseWindow { id: WindowId(1) }
         ));
+    }
+
+    #[test]
+    fn downgrading_a_session_releases_its_held_keys() {
+        let mut event_loop = smithay::reexports::calloop::EventLoop::try_new().unwrap();
+        let display = smithay::reexports::wayland_server::Display::new().unwrap();
+        let mut state = Lwfa::without_listener(&mut event_loop, display);
+        let mut owner = session(SessionMode::Interact);
+        owner.account = "owner".into();
+        state.sessions.insert(1, owner);
+        state.sessions.insert(2, session(SessionMode::Interact));
+        let keyboard = state.seat.get_keyboard().unwrap();
+        handle_shell_event(
+            &mut state,
+            ShellEvent::Message(
+                1,
+                ToEngine::Key {
+                    key: 30,
+                    pressed: true,
+                },
+            ),
+        );
+        handle_shell_event(
+            &mut state,
+            ShellEvent::Message(
+                2,
+                ToEngine::Key {
+                    key: 42,
+                    pressed: true,
+                },
+            ),
+        );
+        assert_eq!(keyboard.pressed_keys().len(), 2);
+
+        handle_shell_event(
+            &mut state,
+            ShellEvent::Message(
+                1,
+                ToEngine::SetSessionMode {
+                    session: 2,
+                    mode: SessionMode::View,
+                },
+            ),
+        );
+        assert_eq!(
+            keyboard.pressed_keys(),
+            [smithay::input::keyboard::Keycode::from(38u32)].into()
+        );
+        // The viewer cannot send its own release after its permission changes.
+        handle_shell_event(
+            &mut state,
+            ShellEvent::Message(
+                2,
+                ToEngine::Key {
+                    key: 42,
+                    pressed: false,
+                },
+            ),
+        );
+        assert_eq!(keyboard.pressed_keys().len(), 1);
+        handle_shell_event(
+            &mut state,
+            ShellEvent::Message(
+                1,
+                ToEngine::Key {
+                    key: 30,
+                    pressed: false,
+                },
+            ),
+        );
+        assert!(keyboard.pressed_keys().is_empty());
     }
 
     #[test]
