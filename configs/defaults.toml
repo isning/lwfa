@@ -19,6 +19,19 @@
 # is gitignored and mode 600. See the README.
 
 # ---------------------------------------------------------------------------
+# Backend
+# ---------------------------------------------------------------------------
+[backend]
+# "nested" creates a host window; "headless" needs no Wayland/X11 host.
+# LWFA_BACKEND overrides this value (and may also be set in .env).
+mode = "nested"
+# Initial headless virtual output; the primary browser can resize it.
+width = 1280
+height = 800
+# Optional: restrict headless EGL selection to one DRM render node.
+# render_node = "/dev/dri/renderD128"
+
+# ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
 [net]

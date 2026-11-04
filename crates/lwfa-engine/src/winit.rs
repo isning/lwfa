@@ -23,7 +23,6 @@ use smithay::backend::renderer::element::utils::{
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::winit::dpi::LogicalSize;
@@ -266,81 +265,20 @@ pub fn init_winit(
     // Whether the swap has been unthrottled. See `never_wait_for_the_host`.
     let swap_never_blocks = Rc::new(Cell::new(false));
 
-    let mode = Mode {
-        size: backend.borrow().window_size(),
-        refresh: 60_000,
-    };
-
-    let output = Output::new(
-        "lwfa-nested".to_string(),
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "lwfa".into(),
-            model: "nested".into(),
-        },
+    let output = crate::output::init(
+        data,
+        "lwfa-nested",
+        "nested",
+        backend.borrow().window_size(),
+        Transform::Flipped180,
     );
-    let _global = output.create_global::<Lwfa>(&data.display_handle);
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Flipped180),
-        None,
-        Some((0, 0).into()),
-    );
-    output.set_preferred(mode);
-
-    data.space.map_output(&output, (0, 0));
-    data.layout.set_output_size(mode.size.to_logical(1));
-
     let mut preview_size = backend.borrow().window_size();
     data.set_preview_size(preview_size);
     let mut damage_tracker = OutputDamageTracker::new(preview_size, 1.0, Transform::Flipped180);
-
-    // Applying a new output size is the same work whether the host resized the
-    // window or a remote shell declared its viewport, so both go through here.
-    // Having two copies is how they drift.
     let apply_output_size = {
         let output = output.clone();
-        move |state: &mut Lwfa, w: i32, h: i32, scale: f64| {
-            let size: smithay::utils::Size<i32, smithay::utils::Physical> = (w, h).into();
-            output.change_current_state(
-                Some(Mode {
-                    size,
-                    refresh: 60_000,
-                }),
-                None,
-                None,
-                None,
-            );
-            output.set_preferred(Mode {
-                size,
-                refresh: 60_000,
-            });
-            let logical = size.to_logical(1);
-            state.layout.set_output_size(logical);
-            state.send_to_shell(lwfa_proto::ToShell::OutputChanged {
-                output: lwfa_proto::Output {
-                    width: logical.w,
-                    height: logical.h,
-                    scale,
-                },
-            });
-            if state.layout.mode() == crate::layout::Mode::Safe {
-                state.apply_safe_mode();
-            }
-            state.apply_layout();
-        }
+        move |state: &mut Lwfa, w, h, scale| crate::output::resize(state, &output, w, h, scale)
     };
-
-    // Handed to the state so `SetViewport` can reach it from the message
-    // handler, which has no access to the output otherwise.
-    data.resize_output = Some(Rc::new({
-        let apply = apply_output_size.clone();
-        move |state: &mut Lwfa, w, h, scale| {
-            tracing::info!("shell viewport is {w}x{h} at scale {scale}; resizing the output");
-            apply(state, w, h, scale);
-        }
-    }));
 
     // Clients spawned from here inherit our socket rather than the host's.
     //

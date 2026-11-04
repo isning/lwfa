@@ -325,7 +325,7 @@ pub struct Lwfa {
     ///
     /// `None` means "follow the window", which is the local-only default.
     pub viewport_override: Option<(i32, i32, f64)>,
-    /// Set by the winit backend so `SetViewport` can resize the real output.
+    /// Set by either backend so `SetViewport` can resize the shared output.
     pub resize_output: Option<Rc<dyn Fn(&mut Lwfa, i32, i32, f64)>>,
 
     /// The X11 window manager, once Xwayland has started and handed us a

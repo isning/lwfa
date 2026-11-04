@@ -6,18 +6,16 @@ A Wayland compositor whose shell is written in web technologies, built so one
 desktop can be driven from another device: a tablet, a phone, a laptop in
 another room.
 
-It runs **nested**. lwfa is a Wayland client of the compositor you already use,
-and appears there as a single window. It does not talk to DRM/KMS, does not own
-an output, and is not a session you log into. That is a deliberate boundary and
-not a stage on the way somewhere: it means starting lwfa can never take down
-the session you were working in. A TTY backend that would own a display
-outright is listed in section 6 as not done.
+The default **nested** backend presents a window on the host compositor. The
+optional **headless** backend creates an EGL/GLES context directly on an EGL
+device and exposes a virtual Wayland output without a host window or DRM/KMS
+scanout. Both share output sizing and the per-window capture and streaming
+pipeline. Browsers still compose the individual window streams.
 
-So there are two places the same session is seen. Locally it is lwfa's window
-on the host's screen, usually given a workspace of its own. Remotely it is a
-browser, with layout that responds to the viewport it is being viewed on. The
-remote case is the one the project exists for; the local window is mostly how
-you develop it and how you check what the remote client is being sent.
+In nested mode the local window provides a preview; headless has no local
+preview or host clipboard bridge. Session state remains in the engine across
+browser disconnects. See [headless.md](headless.md) for configuration and tests.
+The nested backend details below apply only to nested mode.
 
 This document records decisions and the reasoning behind them. It is meant to be
 read before changing anything structural.

@@ -1,7 +1,8 @@
 # Running lwfa
 
 lwfa runs nested inside whatever compositor you are already using, as an
-ordinary window. Starting it cannot take down the session you were working in.
+ordinary window by default. For an independent offscreen session without a host
+display server, use the [headless backend](headless.md).
 
 ```sh
 pnpm run build                # the shell, once

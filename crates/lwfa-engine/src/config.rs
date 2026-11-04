@@ -56,6 +56,7 @@ const SYSTEM_CONFIG: &str = "/etc/lwfa/config.toml";
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub backend: Backend,
     pub net: Net,
     pub host: Host,
     pub window: Window,
@@ -77,6 +78,57 @@ pub struct Config {
     /// be a second source of truth for the same thing.
     #[allow(dead_code)]
     pub animation: toml::Table,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendMode {
+    #[default]
+    Nested,
+    Headless,
+}
+
+impl std::str::FromStr for BackendMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nested" => Ok(Self::Nested),
+            "headless" => Ok(Self::Headless),
+            _ => Err(format!("unknown backend {value:?}; expected nested or headless")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Backend {
+    pub mode: BackendMode,
+    /// Initial headless output size, before the primary browser sets a viewport.
+    pub width: u32,
+    pub height: u32,
+    /// Restrict headless EGL device selection to this DRM render node.
+    pub render_node: Option<PathBuf>,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self { mode: BackendMode::Nested, width: 1280, height: 800, render_node: None }
+    }
+}
+
+impl Backend {
+    pub fn size(&self) -> Result<smithay::utils::Size<i32, smithay::utils::Physical>, String> {
+        let width = i32::try_from(self.width)
+            .map_err(|_| "headless output width exceeds the supported pixel limits")?;
+        let height = i32::try_from(self.height)
+            .map_err(|_| "headless output height exceeds the supported pixel limits")?;
+        let size = (width, height).into();
+        if !crate::surface_density::valid_capture_size(size) {
+            return Err("headless output dimensions exceed the supported pixel limits".into());
+        }
+        Ok(size)
+    }
 }
 
 /// How far the shared clipboard reaches. See `clipboard.rs`.
@@ -275,6 +327,12 @@ impl Render {
 }
 
 impl Config {
+    pub fn backend_mode(&self) -> Result<BackendMode, String> {
+        crate::auth::setting("LWFA_BACKEND")
+            .map(|mode| mode.parse())
+            .unwrap_or(Ok(self.backend.mode))
+    }
+
     /// Load the config, falling back to defaults for anything missing.
     ///
     /// Never returns an error. See the module comment: a compositor that
@@ -664,6 +722,7 @@ mod tests {
         let text = std::fs::read_to_string(path).expect("read configs/defaults.toml");
         let parsed: Config = toml::from_str(&text).expect("defaults.toml parses");
         let built_in = Config::default();
+        assert_eq!(parsed.backend, built_in.backend);
         assert_eq!(parsed.net, built_in.net);
         assert_eq!(parsed.host, built_in.host);
         assert_eq!(parsed.window, built_in.window);
@@ -821,5 +880,30 @@ mod tests {
         assert!(parsed.host.workspace > 0);
         assert!(parsed.stream.max_h264_sessions > 0);
         assert!(!parsed.net.shell_addr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn headless_is_explicit_and_old_configs_remain_nested() {
+        assert_eq!(Config::default().backend.mode, BackendMode::Nested);
+        let old: Config = toml::from_str("[window]\npreview = false").unwrap();
+        assert_eq!(old.backend.mode, BackendMode::Nested);
+        let headless: Config = toml::from_str("[backend]\nmode = 'headless'\nwidth = 800\nheight = 600").unwrap();
+        assert_eq!(headless.backend.mode, BackendMode::Headless);
+        assert_eq!(headless.backend.size().unwrap(), (800, 600).into());
+        assert_eq!("headless".parse::<BackendMode>().unwrap(), BackendMode::Headless);
+        assert!("typo".parse::<BackendMode>().is_err());
+    }
+
+    #[test]
+    fn headless_size_rejects_empty_oversized_and_overflowing_outputs() {
+        for (width, height) in [(0, 800), (800, 0), (u32::MAX, 800), (16384, 16384)] {
+            let backend = Backend { width, height, ..Backend::default() };
+            assert!(backend.size().is_err(), "accepted {width}x{height}");
+        }
     }
 }

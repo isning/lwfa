@@ -17,7 +17,8 @@
 
 **Run your Linux desktop from any browser.** lwfa is a self-hosted remote
 desktop for Wayland. It runs as an ordinary window inside the compositor you
-already use, and serves that session to a browser on any other device: an iPad,
+already use by default, or as an independent [headless compositor](docs/headless.md),
+and serves that session to a browser on any other device: an iPad,
 a laptop, a phone. Video is hardware-encoded H.264 or HEVC, one stream per
 window, decoded with WebCodecs. Audio is Opus. Keyboard, mouse, touch and an
 on-screen gamepad the machine sees as a real controller all come back the other

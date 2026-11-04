@@ -73,3 +73,12 @@ same source. That runs automatically from `dev`, `build`, `test` and
 
 - [Reaching it from another device](remote-access.md)
 - [Accounts and permissions](accounts.md)
+
+## Backend selection
+
+`[backend].mode` selects `nested` (default) or `headless`. `LWFA_BACKEND`
+overrides it, including through `.env`; an invalid override fails startup.
+Headless uses EGL/GLES without a host window. `[backend].width` and `height`
+set the initial virtual output size; the primary browser can resize it.
+`render_node` optionally restricts EGL selection to a DRM render node.
+See [headless.md](headless.md) for driver requirements and verification.

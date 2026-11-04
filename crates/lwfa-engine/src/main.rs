@@ -37,6 +37,8 @@ mod portal;
 mod preview;
 mod upload;
 mod handlers;
+mod headless;
+mod output;
 mod http;
 mod icons;
 mod input;
@@ -96,15 +98,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<Lwfa> = Display::new()?;
     let mut data = Lwfa::new(&mut event_loop, display);
 
-    winit::init_winit(&mut event_loop, &mut data)?;
+    let backend = data.config.backend_mode()?;
+    match backend {
+        config::BackendMode::Nested => winit::init_winit(&mut event_loop, &mut data)?,
+        config::BackendMode::Headless => headless::init(&mut event_loop, &mut data)?,
+    }
     init_shell_link(&mut event_loop, &mut data)?;
-    init_host_clipboard(&mut data, host_display);
+    if backend == config::BackendMode::Headless && data.shell.is_none() {
+        return Err("headless mode requires a working remote shell listener; check LWFA_SHELL_ADDR".into());
+    }
+    if backend == config::BackendMode::Nested {
+        init_host_clipboard(&mut data, host_display);
+    }
     // A remote desktop gets its initial monitor from the primary browser.
     // Local sessions without browser-driven output resizing can start now.
     if data.config.session.xwayland_resolution.is_some() {
         tracing::warn!("session.xwayland_resolution is obsolete and ignored; the primary browser controls display dimensions");
     }
-    if data.resize_output.is_none() {
+    if backend == config::BackendMode::Headless || data.resize_output.is_none() {
         init_xwayland(&mut data);
     }
     init_portal(&mut event_loop, &mut data);

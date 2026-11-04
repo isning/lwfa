@@ -134,3 +134,8 @@ if you forgot.
 
 - [Architecture](architecture.md)
 - [Releasing](releasing.md)
+
+## Independent headless backend
+
+See [headless verification](headless.md#verification) for the driver-dependent
+GLES pixel test and the no-host Wayland/stream/disconnect smoke test.
