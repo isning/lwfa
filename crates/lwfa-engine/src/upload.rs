@@ -561,29 +561,50 @@ fn finish(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    notify_finished(
+        socket,
+        events,
+        Finished {
+            request,
+            path,
+            root,
+        },
+        flight.id,
+        name,
+    )
+}
+
+fn notify_finished<S: Read + Write>(
+    socket: &mut tungstenite::WebSocket<S>,
+    events: &smithay::reexports::calloop::channel::Sender<crate::shell::ShellEvent>,
+    finished: Finished,
+    file: String,
+    name: String,
+) -> Result<(), String> {
+    let request = finished.request;
+    // Transfer ownership before acknowledging the upload. A failed socket
+    // write must not bypass the dialog's registration and cleanup paths.
+    if let Err(err) = events.send(crate::shell::ShellEvent::Uploaded(finished)) {
+        if let crate::shell::ShellEvent::Uploaded(finished) = err.0 {
+            std::fs::remove_file(&finished.path)
+                .map_err(|err| format!("could not remove unclaimed upload: {err}"))?;
+        }
+        return Err("compositor unavailable".into());
+    }
     send(
         socket,
         &lwfa_proto::ToShell::UploadDone {
             request,
-            file: flight.id.clone(),
-            name: name.clone(),
+            file,
+            name,
             ok: true,
             error: None,
         },
-    )?;
-    // The compositor folds it into the dialog's eventual answer. If the
-    // dialog died in the moment between the rename and this landing, the
-    // compositor deletes the file instead; nothing leaks either way.
-    let _ = events.send(crate::shell::ShellEvent::Uploaded(Finished {
-        request,
-        path,
-        root,
-    }));
-    Ok(())
+    )
 }
 
-fn send(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
+fn send<S: Read + Write>(
+    socket: &mut tungstenite::WebSocket<S>,
     message: &lwfa_proto::ToShell,
 ) -> Result<(), String> {
     let json = serde_json::to_string(message).map_err(|err| err.to_string())?;
@@ -735,6 +756,89 @@ mod tests {
         // The successful connection still owns the ticket.
         assert!(accept_upload(HandshakeStream::new(false), &gates).is_none());
         assert!(gates.lock().unwrap()[&7].attached);
+    }
+
+    struct BrokenConnection;
+
+    impl Read for BrokenConnection {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for BrokenConnection {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn completed_upload_is_registered_even_when_reply_fails() {
+        let (events, received) = smithay::reexports::calloop::channel::channel();
+        let mut socket = tungstenite::WebSocket::from_raw_socket(
+            BrokenConnection,
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let path = PathBuf::from("completed-upload.txt");
+        assert!(
+            notify_finished(
+                &mut socket,
+                &events,
+                Finished {
+                    request: 7,
+                    path: path.clone(),
+                    root: None
+                },
+                "file-1".into(),
+                "completed-upload.txt".into(),
+            )
+            .is_err()
+        );
+        let crate::shell::ShellEvent::Uploaded(finished) = received.try_recv().unwrap() else {
+            panic!("expected the completed file to be owned by the compositor");
+        };
+        assert_eq!(finished.request, 7);
+        assert_eq!(finished.path, path);
+    }
+
+    #[test]
+    fn completed_upload_is_removed_when_compositor_is_gone() {
+        let (events, received) = smithay::reexports::calloop::channel::channel();
+        drop(received);
+        let mut socket = tungstenite::WebSocket::from_raw_socket(
+            BrokenConnection,
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "lwfa-finished-upload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::write(&path, b"uploaded").unwrap();
+        let result = notify_finished(
+            &mut socket,
+            &events,
+            Finished {
+                request: 7,
+                path: path.clone(),
+                root: None,
+            },
+            "file-1".into(),
+            "completed-upload.txt".into(),
+        );
+        let leaked = path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+        assert!(!leaked, "a file without an owner must not remain on disk");
     }
 
     #[test]
