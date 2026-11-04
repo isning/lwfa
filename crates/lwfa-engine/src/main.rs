@@ -40,6 +40,8 @@ mod handlers;
 mod http;
 mod icons;
 mod input;
+#[cfg(test)]
+mod input_lifecycle_tests;
 mod layout;
 mod surface_density;
 mod remote_input;
@@ -899,6 +901,7 @@ fn handle_shell_event(state: &mut Lwfa, event: ShellEvent) {
             // socket otherwise, because the seat never hears that a connection
             // died. See `Lwfa::release_keys_for`.
             state.release_keys_for(session);
+            state.release_pointer_for(session);
             // Its file dialogs go dormant rather than dying with it: the
             // application is still blocked on an answer, and the browser is
             // usually about to reconnect. See `files.rs`.
@@ -1373,6 +1376,7 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
                 if let Some(pad) = state.gamepads.get(&target) {
                     pad.neutral();
                 }
+                state.release_pointer_for(target);
                 state.clip_close(target);
             } else {
                 state.clip_open(target);
@@ -1530,7 +1534,7 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
                 state.remote_pointer_motion(window, x, y);
             }
         },
-        ToEngine::PointerButton { button, pressed } => state.remote_pointer_button(button, pressed),
+        ToEngine::PointerButton { button, pressed } => state.remote_pointer_button(session, button, pressed),
         ToEngine::PointerAxis {
             horizontal,
             vertical,
@@ -1539,15 +1543,15 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
         ToEngine::Key { key, pressed } => state.remote_key(session, key, pressed),
         ToEngine::TouchDown { window, id, x, y, normalized } => {
             if let Some((x, y)) = state.input_coordinates(window, x, y, normalized) {
-                state.remote_touch_down(window, id, x, y);
+                state.remote_touch_down(session, window, id, x, y);
             }
         },
         ToEngine::TouchMotion { window, id, x, y, normalized } => {
             if let Some((x, y)) = state.input_coordinates(window, x, y, normalized) {
-                state.remote_touch_motion(window, id, x, y);
+                state.remote_touch_motion(session, window, id, x, y);
             }
         },
-        ToEngine::TouchUp { id } => state.remote_touch_up(id),
+        ToEngine::TouchUp { id } => state.remote_touch_up(session, id),
         ToEngine::Spawn { command, terminal } => {
             // Reaching here means `permitted` already checked both interact and
             // the account's application list.

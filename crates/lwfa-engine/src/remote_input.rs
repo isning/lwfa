@@ -85,7 +85,38 @@ impl Lwfa {
         pointer.frame(self);
     }
 
-    pub fn remote_pointer_button(&mut self, button: ButtonCode, pressed: bool) {
+    pub fn remote_pointer_button(
+        &mut self,
+        session: lwfa_proto::SessionId,
+        button: ButtonCode,
+        pressed: bool,
+    ) {
+        if pressed {
+            if !self.held_buttons.entry(session).or_default().insert(button) {
+                return;
+            }
+        } else {
+            let Some(held) = self.held_buttons.get_mut(&session) else {
+                return;
+            };
+            if !held.remove(&button) {
+                return;
+            }
+        }
+        // Only the first holder presses and the last holder releases a seat
+        // button. Another connection must not release a peer's drag.
+        if self.local_buttons.contains(&button)
+            || self
+                .held_buttons
+                .iter()
+                .any(|(owner, held)| *owner != session && held.contains(&button))
+        {
+            return;
+        }
+        self.send_pointer_button(button, pressed);
+    }
+
+    fn send_pointer_button(&mut self, button: ButtonCode, pressed: bool) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -228,7 +259,17 @@ impl Lwfa {
         );
     }
 
-    pub fn remote_touch_down(&mut self, window: WindowId, id: i32, x: f64, y: f64) {
+    pub fn remote_touch_down(
+        &mut self,
+        session: lwfa_proto::SessionId,
+        window: WindowId,
+        id: i32,
+        x: f64,
+        y: f64,
+    ) {
+        if self.touch_slots.contains_key(&(session, id)) {
+            return;
+        }
         let Some((target, origin, location)) = self.window_point(window, x, y) else {
             return;
         };
@@ -236,6 +277,12 @@ impl Lwfa {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
+        let Some(slot) =
+            (0..=i32::MAX as u32).find(|slot| !self.touch_slots.values().any(|used| used == slot))
+        else {
+            return;
+        };
+        self.touch_slots.insert((session, id), slot);
         let serial = SERIAL_COUNTER.next_serial();
         let under = self.surface_in(&target, origin, location);
         let time = self.millis();
@@ -249,7 +296,7 @@ impl Lwfa {
             self,
             under,
             &DownEvent {
-                slot: Some(id as u32).into(),
+                slot: Some(slot).into(),
                 location,
                 serial,
                 time,
@@ -258,7 +305,17 @@ impl Lwfa {
         touch.frame(self);
     }
 
-    pub fn remote_touch_motion(&mut self, window: WindowId, id: i32, x: f64, y: f64) {
+    pub fn remote_touch_motion(
+        &mut self,
+        session: lwfa_proto::SessionId,
+        window: WindowId,
+        id: i32,
+        x: f64,
+        y: f64,
+    ) {
+        let Some(&slot) = self.touch_slots.get(&(session, id)) else {
+            return;
+        };
         let Some((target, origin, location)) = self.window_point(window, x, y) else {
             return;
         };
@@ -272,7 +329,7 @@ impl Lwfa {
             self,
             under,
             &TouchMotionEvent {
-                slot: Some(id as u32).into(),
+                slot: Some(slot).into(),
                 location,
                 time,
             },
@@ -280,7 +337,14 @@ impl Lwfa {
         touch.frame(self);
     }
 
-    pub fn remote_touch_up(&mut self, id: i32) {
+    pub fn remote_touch_up(&mut self, session: lwfa_proto::SessionId, id: i32) {
+        let Some(slot) = self.touch_slots.remove(&(session, id)) else {
+            return;
+        };
+        self.send_touch_up(slot);
+    }
+
+    fn send_touch_up(&mut self, slot: u32) {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
@@ -289,12 +353,36 @@ impl Lwfa {
         touch.up(
             self,
             &UpEvent {
-                slot: Some(id as u32).into(),
+                slot: Some(slot).into(),
                 serial,
                 time,
             },
         );
         touch.frame(self);
+    }
+
+    /// End only this connection's pointer and touch sequences.
+    pub fn release_pointer_for(&mut self, session: lwfa_proto::SessionId) {
+        if let Some(buttons) = self.held_buttons.remove(&session) {
+            for button in buttons {
+                if !self.local_buttons.contains(&button)
+                    && !self
+                        .held_buttons
+                        .values()
+                        .any(|held| held.contains(&button))
+                {
+                    self.send_pointer_button(button, false);
+                }
+            }
+        }
+        let contacts: Vec<i32> = self
+            .touch_slots
+            .keys()
+            .filter_map(|(owner, id)| (*owner == session).then_some(*id))
+            .collect();
+        for id in contacts {
+            self.remote_touch_up(session, id);
+        }
     }
 
     /// Milliseconds since start, which is what Wayland input events want.
