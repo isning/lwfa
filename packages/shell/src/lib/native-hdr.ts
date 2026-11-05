@@ -31,6 +31,8 @@ export class NativeHdrPresenter {
   #pending: Job | null = null
   #running = false
   #destroyed = false
+  #lastSource: VideoFrame | null = null
+  #lastSubmission: Promise<void> | null = null
   #videoCallback: number | null = null
   #lastPresented: number | null = null
   #lastDropped = 0
@@ -56,11 +58,16 @@ export class NativeHdrPresenter {
 
   draw(video: VideoFrame): Promise<void> {
     if (this.#destroyed) return Promise.resolve()
+    // The media element retains the displayed image across geometry changes.
+    // Rewriting that same source would fabricate frames and playback drops.
+    if (video === this.#lastSource && this.#lastSubmission)
+      return this.#lastSubmission
     // Rebase on arrival time: decoder timestamps advance only on submitted
     // frames, so idle applications otherwise leave playback far in the past.
     const frame = new VideoFrame(video, { timestamp: Math.round(performance.now() * 1000) })
     inheritTiming(video,frame)
-    return new Promise((resolve, reject) => {
+    this.#lastSource = video
+    return this.#lastSubmission = new Promise((resolve, reject) => {
       if(this.#pending)count("nativeReplaced")
       this.#pending?.frame.close()
       this.#pending?.resolve()
@@ -110,6 +117,8 @@ export class NativeHdrPresenter {
   destroy(): void {
     if (this.#destroyed) return
     this.#destroyed = true
+    this.#lastSource = null
+    this.#lastSubmission = null
     this.#unsubscribe()
     this.#watchPresentation()
     this.#pending?.frame.close()

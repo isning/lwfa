@@ -96,7 +96,8 @@ export const COUNTERS = {
   audioUnderruns: "Audio underruns",
   decodeFailures: "Terminal decoder/config failures",
   receivedFrames: "Received frames",
-  renderedFrames: "Render submissions",
+  renderedFrames: "First frame submissions",
+  redraws: "Cached frame redraws",
 } as const
 export type Counter = keyof typeof COUNTERS
 export interface Distribution {
@@ -284,10 +285,18 @@ export function count(name: Counter, amount = 1): void {
   performanceStats.count(name, amount)
 }
 export interface FrameTiming {
+  epoch: number
   received: number
   decoded?: number
   ready?: number
+  submitted?: number
 }
+interface RenderTiming {
+  started: number
+  trace: FrameTiming
+  ready: number | undefined
+}
+let timingEpoch = 0
 let timings = new WeakMap<object, FrameTiming>()
 const arrivals = new Map<number, number>()
 export function frameReceived(frame: DecodedFrame): void {
@@ -297,11 +306,12 @@ export function frameReceived(frame: DecodedFrame): void {
   if (last !== undefined) observe("arrivalGap", now - last)
   if (arrivals.size >= 128) arrivals.delete(arrivals.keys().next().value!)
   arrivals.set(frame.header.window, now)
-  timings.set(frame, { received: now })
+  timings.set(frame, { epoch: timingEpoch, received: now })
   count("receivedFrames")
 }
 export function timing(frame: object): FrameTiming | undefined {
-  return performanceStats.enabled ? timings.get(frame) : undefined
+  const trace = performanceStats.enabled ? timings.get(frame) : undefined
+  return trace?.epoch === timingEpoch ? trace : undefined
 }
 export function inheritTiming(source: object, target: object): void {
   const trace = timing(source)
@@ -312,7 +322,7 @@ export function decodeFinished(
   trace: FrameTiming | undefined,
   started: number,
 ): void {
-  if (!trace || !performanceStats.enabled) return
+  if (!trace || trace.epoch !== timingEpoch || !performanceStats.enabled) return
   const now = performance.now()
   observe("decode", now - started)
   trace.decoded = now
@@ -330,39 +340,44 @@ export function converted(
   trace.ready = performance.now()
   timings.set(target, trace)
 }
-export function renderStarted(frame: object): number | undefined {
-  if (!performanceStats.enabled) return
-  const now = performance.now(),
-    trace = timing(frame)
+export function renderStarted(frame: object): RenderTiming | undefined {
+  const trace = timing(frame)
   if (!trace) return undefined
-  if (trace?.ready !== undefined) observe("frameWait", now - trace.ready)
-  return now
+  return { started: performance.now(), trace, ready: trace.ready }
 }
 export function renderFinished(
   frame: object,
-  started: number | undefined,
+  submission: RenderTiming | undefined,
   native = false,
 ): void {
-  if (started === undefined || !performanceStats.enabled) return
+  if (!submission || timing(frame) !== submission.trace) return
   const now = performance.now()
-  observe(native ? "nativeWrite" : "render", now - started)
-  const trace = timing(frame)
-  if (trace) observe("receiveToSubmit", now - trace.received)
-  count("renderedFrames")
+  observe(native ? "nativeWrite" : "render", now - submission.started)
+  const trace = submission.trace
+  // Aliases and cloned VideoFrames share a trace. Only the first successful
+  // submission measures a new frame; a later repaint is the age of cached art.
+  if (trace.submitted === undefined) {
+    trace.submitted = now
+    if (submission.ready !== undefined)
+      observe("frameWait", submission.started - submission.ready)
+    observe("receiveToSubmit", now - trace.received)
+    count("renderedFrames")
+  } else count("redraws")
 }
 export function resetFrameTimings(): void {
+  timingEpoch++
   timings = new WeakMap()
   arrivals.clear()
 }
 export function exportPerformance(snapshot: PerformanceSnapshot): string {
   return JSON.stringify(
     {
-      version: 1,
+      version: 2,
       recordedAt: new Date().toISOString(),
       timeOrigin: performance.timeOrigin,
       units: "milliseconds unless labelled otherwise",
       scope:
-        "Server stages are process-wide; client stages are this tab. Submission/callback timing is not physical screen presentation. No exact one-way network or application latency is measured.",
+        "Server stages are process-wide; client stages are this tab. Frame waiting/age and renderedFrames measure first successful submissions only; cached redraws are separate. Submission/callback timing is not physical screen presentation. No exact one-way network or application latency is measured.",
       ...snapshot,
     },
     null,

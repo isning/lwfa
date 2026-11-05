@@ -29,8 +29,7 @@ it("bounds writes, owns frames, rebases timestamps and stops playback on cleanup
   vi.stubGlobal("MediaStream", class {})
   const element = { play: vi.fn(async () => {}), pause: vi.fn(), srcObject: null } as unknown as HTMLVideoElement
   const presenter = new NativeHdrPresenter(element, vi.fn())
-  const source = {} as VideoFrame
-  const jobs = [presenter.draw(source), presenter.draw(source), presenter.draw(source)]
+  const jobs = [presenter.draw({} as VideoFrame), presenter.draw({} as VideoFrame), presenter.draw({} as VideoFrame)]
   await jobs[1]
   await new Promise(resolve => setTimeout(resolve, 0))
   expect(write).toHaveBeenCalledTimes(1)
@@ -45,4 +44,34 @@ it("bounds writes, owns frames, rebases timestamps and stops playback on cleanup
   expect(stop).toHaveBeenCalledTimes(1)
   expect(element.srcObject).toBeNull()
   expect(abort).toHaveBeenCalledTimes(1)
+})
+
+it("shares an identical source's submission and does not resubmit it on cached redraws", async () => {
+  const clone = vi.fn()
+  vi.stubGlobal("VideoFrame", class { constructor() { clone() } close() {} })
+  let finish!: () => void
+  const blocked = new Promise<void>(resolve => { finish = resolve })
+  const write = vi.fn().mockImplementationOnce(() => blocked).mockResolvedValue(undefined)
+  vi.stubGlobal("MediaStreamTrackGenerator", class { writable = { getWriter: () => ({ write, abort: vi.fn(async () => {}) }) }; stop() {} })
+  vi.stubGlobal("MediaStream", class {})
+  const element = { play: vi.fn(async () => {}), pause: vi.fn(), srcObject: null } as unknown as HTMLVideoElement
+  const source = { close: vi.fn() } as unknown as VideoFrame
+  const presenter = new NativeHdrPresenter(element, vi.fn())
+  const first = presenter.draw(source), duplicate = presenter.draw(source)
+  expect(duplicate).toBe(first)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect(clone).toHaveBeenCalledTimes(1)
+  expect(write).toHaveBeenCalledTimes(1)
+  finish()
+  await first
+  await presenter.draw(source)
+  expect(write).toHaveBeenCalledTimes(1)
+  await presenter.draw({} as VideoFrame)
+  expect(write).toHaveBeenCalledTimes(2)
+  expect(source.close).not.toHaveBeenCalled()
+  presenter.destroy()
+  const nextPresenter = new NativeHdrPresenter(element, vi.fn())
+  await nextPresenter.draw(source)
+  expect(write).toHaveBeenCalledTimes(3)
+  nextPresenter.destroy()
 })

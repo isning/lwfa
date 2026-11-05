@@ -128,12 +128,76 @@ it("carries one frame's timing through asynchronous decode, bitmap conversion an
   resetFrameTimings()
   expect(renderStarted(wrapper)).toBeUndefined()
 })
+it("counts a cached redraw separately without aging a frame's first submission", () => {
+  let now = 10
+  vi.spyOn(performance, "now").mockImplementation(() => now)
+  performanceStats.setEnabled(true)
+  const wire = { header: { window: 1 } } as DecodedFrame
+  frameReceived(wire)
+  const drawable = {}, clone = {}
+  now = 13
+  decodeFinished(drawable, timing(wire), 11)
+  now = 14
+  const first = renderStarted(drawable)
+  now = 14.1
+  renderFinished(drawable, first)
+  now = 25014
+  inheritTiming(drawable, clone)
+  const redraw = renderStarted(clone)
+  now = 25014.1
+  renderFinished(clone, redraw)
+  performanceStats.tick(now)
+  const state = performanceStats.snapshot(), stages = state.points.at(-1)!.stages
+  expect(stages.frameWait).toBeUndefined()
+  expect(stages.receiveToSubmit).toBeUndefined()
+  expect(stages.render?.p50).toBeCloseTo(0.1)
+  expect(state.totals.receivedFrames).toBe(1)
+  expect(state.totals.renderedFrames).toBe(1)
+  expect(state.totals.redraws).toBe(1)
+})
+it("records frame waiting only when a submission succeeds", () => {
+  let now = 10
+  vi.spyOn(performance, "now").mockImplementation(() => now)
+  performanceStats.setEnabled(true)
+  const wire = { header: { window: 1 } } as DecodedFrame, drawable = {}
+  frameReceived(wire)
+  now = 12
+  decodeFinished(drawable, timing(wire), 10)
+  now = 14
+  renderStarted(drawable) // The draw fails before submission completes.
+  now = 20
+  const retry = renderStarted(drawable)
+  now = 21
+  renderFinished(drawable, retry)
+  performanceStats.tick(now)
+  expect(performanceStats.snapshot().points.at(-1)!.stages.frameWait).toEqual({ samples: 1, p50: 8, p95: 8, max: 8 })
+})
+it("rejects in-flight decode and render timing after a recording reset", () => {
+  let now = 10
+  vi.spyOn(performance, "now").mockImplementation(() => now)
+  performanceStats.setEnabled(true)
+  const wire = { header: { window: 1 } } as DecodedFrame, drawable = {}, late = {}
+  frameReceived(wire)
+  const trace = timing(wire)
+  now = 12
+  decodeFinished(drawable, trace, 10)
+  const started = renderStarted(drawable)
+  resetFrameTimings()
+  performanceStats.clear()
+  now = 100
+  decodeFinished(late, trace, 10)
+  renderFinished(drawable, started)
+  performanceStats.tick(now)
+  expect(timing(late)).toBeUndefined()
+  expect(performanceStats.snapshot().points.at(-1)!.stages).toEqual({})
+  expect(performanceStats.snapshot().totals).toEqual({})
+})
 it("exports only numeric diagnostics and measurement scope", () => {
   const recorder = new PerformanceRecorder()
   recorder.setEnabled(true)
   recorder.tick(100)
   const exported = JSON.parse(exportPerformance(recorder.snapshot()))
-  expect(exported.version).toBe(1)
+  expect(exported.version).toBe(2)
   expect(exported.points[0].at).toBe(100)
   expect(exported.scope).toContain("not physical")
   expect(Object.keys(exported)).not.toContain("password")

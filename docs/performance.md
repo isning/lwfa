@@ -35,10 +35,10 @@ must not be added together to manufacture an end-to-end latency.
 | Reorder wait | Packet complete → safe release to decoder | Shows waiting for predictive references |
 | Decode submit → output | Compressed video submission → decoder output callback | Includes decoder scheduling; JPEG includes bitmap decode |
 | VideoFrame → bitmap | Conversion request → bitmap ready | Only applicable to the SDR bitmap path |
-| Drawable → renderer wait | Decoded/converted drawable ready → actual renderer work | Includes native/HDR queueing; replaced pending jobs are not presented |
+| Drawable → renderer wait | Decoded/converted drawable ready → first successful submission's renderer start | Cached redraws and failed draws do not create another latency sample |
 | Canvas draw / upload / submit | Drawing starts → GPU submission / Canvas2D draw return | Not a GPU timestamp or display measurement |
 | Native video write | Generated-track writer call → completion | Not the native video's display time |
-| Receive → submission | Complete frame received → renderer/native write completed | One frame's browser-local age; excludes network, app and physical display |
+| Receive → first submission | Complete frame received → first renderer/native write completed | One frame's browser-local age; cached redraws are counted separately |
 | Native video callback interval | Successive requestVideoFrameCallback callbacks | Presentation cadence, not exact panel scanout |
 | Browser animation interval | Successive visible-page animation callbacks | Reset when visibility changes; not a video FPS guarantee |
 | Browser long task | Browser PerformanceObserver long-task duration | Browser-dependent; normally tasks over 50 ms, not a custom stall detector |
@@ -69,6 +69,14 @@ report. History and exported data contain numbers, metric names and timing only:
 no credentials, URLs, window titles, input content, pixels or audio samples.
 The export includes the browser time origin so monotonic sample timestamps can
 be mapped to wall time. Paused/background tabs may produce fewer timeline points.
+
+Export version 2 measures frame waiting and receive-to-submission only for the
+first successful submission of each new frame. Later Canvas repaints count as
+cached redraws; geometry changes do not resubmit the same frame to native video.
+Render-call durations still include actual repaint work. Version 1 recordings
+can contain misleading multi-second frame ages when old content is redrawn.
+Reset/visibility/connection boundaries invalidate timing from asynchronous work
+that began before the boundary.
 
 Server instrumentation is opt-in and expires five seconds after the last probe.
 A connection may request at most two snapshots per second. Timers, long-task
