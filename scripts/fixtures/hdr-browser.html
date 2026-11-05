@@ -86,6 +86,26 @@ window.runHdrProbe = async (failure = "device") => {
   release(); await Promise.all(jobs);
   if (copies!==2 || clones.some(frame=>frame.codedWidth!==0)) throw Error('Frame lifetime leak');
   uploader.destroy();texture.destroy();
+  const oddUploader=new HdrPlanes(device,await HdrPlanes.pipeline(device));
+  const oddTexture=device.createTexture({size:[3,3],format:'rgba16float',usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const oddWords=new Uint16Array(17); oddWords.fill(500,0,9);
+  oddWords.set([512,550,512,550],9);oddWords.set([512,600,512,600],13);
+  const oddFrame=new VideoFrame(oddWords,{format:'I420P10',codedWidth:3,codedHeight:3,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+  await oddUploader.draw(oddFrame,()=>oddTexture.createView(),()=>true);oddFrame.close();
+  const oddRead=device.createBuffer({size:768,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  const oddEncoder=device.createCommandEncoder();oddEncoder.copyTextureToBuffer({texture:oddTexture},{buffer:oddRead,bytesPerRow:256},[3,3]);device.queue.submit([oddEncoder.finish()]);
+  await oddRead.mapAsync(GPUMapMode.READ);
+  const oddPixel=Array.from(new Uint16Array(oddRead.getMappedRange()).slice(4,7),half);
+  const y=(500-64)/876,u=(550-512)*.25/896,v=(600-512)*.25/896;
+  const oddNits=[y+1.4746*v,y-.164553*u-.571353*v,y+1.8814*u].map(pq=>{
+    const p=pq**(1/(2523/32));return (Math.max(p-3424/4096,0)/(2413/128-2392/128*p))**(1/(2610/16384))*10000;
+  });
+  const oddExpected=[[1.343578,-.282180,-.061398],[-.065298,1.075788,-.010490],[.002822,-.019599,1.016777]].map(row=>{
+    const linear=row.reduce((sum,c,i)=>sum+c*oddNits[i],0)/203;
+    return Math.sign(linear)*(Math.abs(linear)<=.0031308?12.92*Math.abs(linear):1.055*Math.abs(linear)**(1/2.4)-.055);
+  });
+  if (oddPixel.some((value,i)=>Math.abs(value-oddExpected[i])>.003)) throw Error('Odd-size chroma reconstruction failed: '+JSON.stringify({oddPixel,oddExpected}));
+  oddRead.destroy();oddTexture.destroy();oddUploader.destroy();
   const path=hdrPresentationPath();
   let changes=0;
   window.addEventListener(HDR_CHANGED,()=>changes++);

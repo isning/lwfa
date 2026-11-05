@@ -7,7 +7,8 @@ const shader = `${HDR_SHADER}
 @group(0) @binding(2) var cr: texture_2d<u32>;
 fn chroma(plane: texture_2d<u32>, uv: vec2f) -> f32 {
   let dimensions=vec2i(textureDimensions(plane));
-  let point=uv*vec2f(dimensions)-0.5;
+  // Chroma spacing stays two luma pixels even when dimensions are odd.
+  let point=uv*vec2f(textureDimensions(luma))*0.5-0.5;
   let base=vec2i(floor(point));
   let weight=fract(point);
   let a=f32(textureLoad(plane,clamp(base,vec2i(0),dimensions-1),0).r);
