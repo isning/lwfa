@@ -1005,6 +1005,12 @@ pub enum GamingAction { Status, Install, SaveProfile }
 #[serde(rename_all = "camelCase")]
 pub enum GamingComponent { Proton, Lsfg, Framegen }
 
+/// Scroll semantics reported by a client, independent of its physical device.
+/// Browser clients infer these; native clients can use their platform input API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PointerAxisSource { Wheel, Continuous }
+
 /// Shell to engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -1160,7 +1166,13 @@ pub enum ToEngine {
 
     /// Scroll. Values are logical pixels, positive right and down.
     #[serde(rename_all = "camelCase")]
-    PointerAxis { horizontal: f64, vertical: f64 },
+    PointerAxis {
+        horizontal: f64,
+        vertical: f64,
+        /// Absent in older clients; preserve their continuous input behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<PointerAxisSource>,
+    },
 
     /// The pointer left the shell's window area entirely.
     #[serde(rename_all = "camelCase")]
@@ -2008,5 +2020,25 @@ mod window_input_tests {
             let json = format!(r#"{{"type":"setWindowScaling","id":1,"scaling":{{"mode":"{mode}","scale":1.5}}}}"#);
             assert!(serde_json::from_str::<ToEngine>(&json).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_source_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_source_is_optional_and_round_trips_without_changing_legacy_messages() {
+        let legacy = r#"{"type":"pointerAxis","horizontal":0.25,"vertical":10.0}"#;
+        let message: ToEngine = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(message, ToEngine::PointerAxis { source: None, .. }));
+        assert!(!serde_json::to_value(message).unwrap().as_object().unwrap().contains_key("source"));
+        for (name, source) in [("wheel", PointerAxisSource::Wheel), ("continuous", PointerAxisSource::Continuous)] {
+            let wire = serde_json::json!({"type":"pointerAxis", "horizontal":0.25, "vertical":10.0, "source":name});
+            let message: ToEngine = serde_json::from_value(wire.clone()).unwrap();
+            assert!(matches!(message, ToEngine::PointerAxis { source: Some(value), .. } if value == source));
+            assert_eq!(serde_json::to_value(message).unwrap(), wire);
+        }
+        assert!(serde_json::from_str::<ToEngine>(r#"{"type":"pointerAxis","horizontal":0,"vertical":1,"source":"guess"}"#).is_err());
     }
 }

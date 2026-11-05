@@ -162,12 +162,22 @@ impl Lwfa {
         pointer.frame(self);
     }
 
-    pub fn remote_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+    pub fn remote_pointer_axis(
+        &mut self,
+        horizontal: f64,
+        vertical: f64,
+        source: Option<lwfa_proto::PointerAxisSource>,
+    ) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let mut frame =
-            AxisFrame::new(self.millis()).source(smithay::backend::input::AxisSource::Continuous);
+        let source = match source {
+            Some(lwfa_proto::PointerAxisSource::Wheel) => smithay::backend::input::AxisSource::Wheel,
+            Some(lwfa_proto::PointerAxisSource::Continuous) | None => {
+                smithay::backend::input::AxisSource::Continuous
+            }
+        };
+        let mut frame = AxisFrame::new(self.millis()).source(source);
         if horizontal != 0.0 {
             frame = frame.value(smithay::backend::input::Axis::Horizontal, horizontal);
         }

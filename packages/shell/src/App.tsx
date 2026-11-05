@@ -449,6 +449,7 @@ export function App(): React.ReactElement {
           type: "pointerAxis",
           horizontal: event.horizontal,
           vertical: event.vertical,
+          ...(event.source ? { source: event.source } : {}),
         });
         break;
       case "key":

@@ -20,7 +20,7 @@ import { drawHdr } from "@/lib/hdr"
 import { tap } from "@/lib/haptics"
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react"
 import type { Rect, WindowId } from "@lwfa/proto"
-import { edgeLeave, edgePark, evdevFromButton, wheelDelta, windowPoint } from "./input.js"
+import { edgeLeave, edgePark, evdevFromButton, wheelDelta, wheelSource, windowPoint } from "./input.js"
 import { describe, measure, probeEnabled } from "@/lib/captureProbe"
 import { LongPress } from "@/lib/longPress"
 import { useDock } from "@/lib/dock"
@@ -118,7 +118,7 @@ export interface WindowSurfaceProps {
 export type SurfaceInput =
   | { kind: "motion"; x: number; y: number }
   | { kind: "button"; button: number; pressed: boolean }
-  | { kind: "axis"; horizontal: number; vertical: number }
+  | { kind: "axis"; horizontal: number; vertical: number; source?: "wheel" | "continuous" }
   | { kind: "key"; key: number; pressed: boolean }
   | { kind: "touchDown"; id: number; x: number; y: number }
   | { kind: "touchMotion"; id: number; x: number; y: number }
@@ -231,7 +231,7 @@ export const WindowSurface = memo(function WindowSurface({
     if (!element) return
     const onWheel = (event: WheelEvent) => {
       event.preventDefault()
-      send({ kind: "axis", ...wheelDelta(event) })
+      send({ kind: "axis", ...wheelDelta(event), source: wheelSource(event) })
     }
     element.addEventListener("wheel", onWheel, { passive: false })
     return () => element.removeEventListener("wheel", onWheel)

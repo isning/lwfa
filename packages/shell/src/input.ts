@@ -233,6 +233,32 @@ export function wheelDelta(event: WheelEvent): { horizontal: number; vertical: n
 }
 
 /**
+ * Infer scroll semantics for the web client only. The DOM has no authoritative
+ * mouse/trackpad discriminator. Prefer explicit units and native momentum;
+ * Chromium's legacy detent metadata is a fallback, never a device identity.
+ * Ambiguous/high-resolution input stays continuous and is not quantized.
+ */
+export function wheelSource(event: WheelEvent): "wheel" | "continuous" {
+  const native = event as WheelEvent & {
+    momentum?: boolean
+    wheelDeltaX?: number
+    wheelDeltaY?: number
+  }
+  if (native.momentum === true || event.ctrlKey) return "continuous"
+  if (event.deltaMode === 1 || event.deltaMode === 2) return "wheel"
+  // Diagonal travel is usually a continuous gesture. Do not turn it into
+  // discrete wheel steps just because one component happens to be integral.
+  if (event.deltaX !== 0 && event.deltaY !== 0) return "continuous"
+  const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX
+  const legacy = event.deltaY !== 0 ? native.wheelDeltaY : native.wheelDeltaX
+  if (delta === 0 || typeof legacy !== "number" || !Number.isFinite(legacy)) return "continuous"
+  // Chromium maps precise pixel movement to legacy wheelDelta at -3x.
+  // Check this first: a touchpad delta of 40 can also look like a 120 detent.
+  if (Math.abs(legacy + 3 * delta) < 0.01) return "continuous"
+  return legacy !== 0 && Math.abs(legacy) % 120 === 0 ? "wheel" : "continuous"
+}
+
+/**
  * Keys the shell keeps for itself rather than forwarding.
  *
  * Deliberately tiny. Every key swallowed here is one the user cannot send to

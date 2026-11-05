@@ -1562,7 +1562,8 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
         ToEngine::PointerAxis {
             horizontal,
             vertical,
-        } => state.remote_pointer_axis(horizontal, vertical),
+            source,
+        } => state.remote_pointer_axis(horizontal, vertical, source),
         ToEngine::PointerLeave => state.remote_pointer_leave(),
         ToEngine::Key { key, pressed } => state.remote_key(session, key, pressed),
         ToEngine::TouchDown { window, id, x, y, normalized } => {

@@ -408,6 +408,28 @@ falls back to JPEG. Encryption and hardware decoding arrive together.
 Engine-native TLS remains future work; until then, anywhere without a proxy
 needs an SSH or WireGuard tunnel.
 
+### Browser scroll input
+
+The browser infers scroll **semantics per event**, not a permanent device type.
+`wheelSource` recognizes line/page steps and Chromium's legacy 120-unit detent
+metadata, while native `WheelEvent.momentum`, precise proportional deltas,
+diagonal gestures and ambiguous pixel events remain continuous. This is a
+best-effort browser heuristic: high-resolution wheels, driver remapping and
+browsers without detent metadata can be ambiguous. Native clients can supply
+operation semantics directly without running this browser heuristic.
+
+The optional `pointerAxis.source` is `wheel` or `continuous`. The engine maps it
+to the corresponding Wayland axis source; the application owns wheel animation.
+Continuous events include any already-generated client inertia, so this path
+does not synthesize another fling or pretend to know when fingers lifted.
+Distances retain their fractional axis values; classification does not round or
+snap them to detents. Browser pixel-to-axis conversion remains in `wheelDelta`.
+
+The shell sends the extension only after `capabilities.json` advertises
+`pointerAxisSource: true`. Older strict engines receive the original message;
+older clients omit `source` and retain continuous behavior on new engines.
+The capability is rechecked on reconnect and applies to both transports.
+
 ## 7. Development environment
 
 **No VM.** The dev machine has a single NVIDIA RTX 3060 with no iGPU, so VFIO

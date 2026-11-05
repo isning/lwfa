@@ -566,7 +566,7 @@ export type ToEngine =
    */
   | { type: "pointerMotion"; window: WindowId; x: number; y: number; normalized?: boolean }
   | { type: "pointerButton"; button: ButtonCode; pressed: boolean }
-  | { type: "pointerAxis"; horizontal: number; vertical: number }
+  | { type: "pointerAxis"; horizontal: number; vertical: number; source?: "wheel" | "continuous" }
   | { type: "pointerLeave" }
   | { type: "key"; key: KeyCode; pressed: boolean }
   /** Touch is first-class, not synthesised into pointer events. */
@@ -1606,11 +1606,16 @@ export function decodeToEngine(text: string): ToEngine {
     }
     case "pointerAxis": {
       const where = `${at}.pointerAxis`
-      noExtraKeys(o, ["type", "horizontal", "vertical"], where)
+      noExtraKeys(o, ["type", "horizontal", "vertical", "source"], where)
+      const source = "source" in o ? str(o, "source", where) : undefined
+      if (source !== undefined && source !== "wheel" && source !== "continuous") {
+        throw new ProtocolError(`${where}.source: expected wheel or continuous`)
+      }
       return {
         type: "pointerAxis",
         horizontal: num(o, "horizontal", where),
         vertical: num(o, "vertical", where),
+        ...(source !== undefined ? { source } : {}),
       }
     }
     case "pointerLeave": {

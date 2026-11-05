@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest"
-import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, wheelDelta, windowPoint } from "../src/input"
+import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, wheelDelta, wheelSource, windowPoint } from "../src/input"
 
 /** A DOM-free stand-in, since these run in node. */
 class FakeElement {
@@ -256,5 +256,34 @@ describe("browser wheel to Wayland axis units", () => {
   it("normalizes line and page modes before converting axis units", () => {
     expect(wheel(3, -3, 1)).toEqual(wheel(48, -48))
     expect(wheel(0, 1, 2)).toEqual(wheel(0, 400))
+  })
+})
+
+
+describe("scroll operation classification", () => {
+  const source = (deltaY: number, extra: object = {}) => wheelSource({ deltaX: 0, deltaY, deltaMode: 0, ctrlKey: false, ...extra } as WheelEvent)
+  it("recognizes line and page wheel steps", () => {
+    expect(source(3, { deltaMode: 1 })).toBe("wheel")
+    expect(source(1, { deltaMode: 2 })).toBe("wheel")
+  })
+  it("recognizes Chromium mouse detents on Windows and macOS", () => {
+    expect(source(100, { wheelDeltaY: -120 })).toBe("wheel")
+    expect(source(3, { wheelDeltaY: -120 })).toBe("wheel")
+    expect(source(-6, { wheelDeltaY: 240 })).toBe("wheel")
+  })
+  it("keeps precise, momentum and ambiguous pixel events continuous", () => {
+    for (const delta of [0.4, 4, 40, 80]) {
+      expect(source(delta, { wheelDeltaY: -3 * delta })).toBe("continuous")
+    }
+    expect(source(100)).toBe("continuous")
+    expect(source(100, { wheelDeltaY: -120, ctrlKey: true })).toBe("continuous")
+    expect(source(100, { wheelDeltaY: -120, momentum: true })).toBe("continuous")
+  })
+  it("classifies each operation independently when devices alternate", () => {
+    expect([source(100, { wheelDeltaY: -120 }), source(0.4, { wheelDeltaY: -1.2 }), source(3, { deltaMode: 1 })]).toEqual(["wheel", "continuous", "wheel"])
+  })
+  it("recognizes horizontal detents without classifying diagonal gestures as wheels", () => {
+    expect(source(0, { deltaX: 100, wheelDeltaX: -120 })).toBe("wheel")
+    expect(source(40, { deltaX: 20, wheelDeltaX: -60, wheelDeltaY: -120 })).toBe("continuous")
   })
 })

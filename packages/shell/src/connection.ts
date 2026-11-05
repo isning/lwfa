@@ -114,6 +114,7 @@ const IDLE_PROBE_MS = 3_000
 const WATCHDOG_MS = 1_000
 
 export class Connection {
+  #axisSources = false
   #hdrSupport: boolean | undefined
   #hdrProbe: Promise<void> | null = null
   #streams: Extract<ToEngine, { type: "setStreams" }> | null = null
@@ -234,6 +235,7 @@ export class Connection {
     if (this.#closed) return
     this.#handlers.onStatus("connecting")
 
+    this.#axisSources = false
     this.#hdrSupport = undefined
     this.#hdrProbe = null
     const socket = sessionSocket(this.#url)
@@ -244,6 +246,21 @@ export class Connection {
 
     socket.onopen = () => {
       this.#retryMs = RECONNECT_MIN_MS
+      // Older engines reject unknown message fields. Discover this additive
+      // extension before sending source metadata, including over WebSocket.
+      void (async () => {
+        try {
+          const url = new URL(this.#url)
+          url.protocol = url.protocol === "wss:" ? "https:" : "http:"
+          url.pathname = url.pathname.replace(/\/$/, "") + "/capabilities.json"
+          url.search = ""
+          const response = await fetch(url, { cache: "no-store", credentials: "omit", signal: AbortSignal.timeout(5000) })
+          const body: unknown = response.ok ? await response.clone().json() : null
+          if (this.#socket === socket && !this.#closed) {
+            this.#axisSources = typeof body === "object" && body !== null && "pointerAxisSource" in body && body.pointerAxisSource === true
+          }
+        } catch { /* Old/cross-origin engines retain their existing input path. */ }
+      })()
       // Not "connected" yet: the engine's Hello decides that, since a version
       // mismatch means an open socket we must not drive.
     }
@@ -393,6 +410,10 @@ export class Connection {
 
   send(message: ToEngine): void {
     if (this.#socket?.readyState !== WebSocket.OPEN) return
+    if (message.type === "pointerAxis" && message.source !== undefined && !this.#axisSources) {
+      const { source: _source, ...legacy } = message
+      message = legacy
+    }
     if (message.type === "setStreams") {
       this.#socket.setWindows?.(message.windows)
       this.#streams = message

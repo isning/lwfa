@@ -205,3 +205,15 @@ describe("strictness", () => {
     expect(() => decodeToShell("{not json")).toThrow(/invalid JSON/)
   })
 })
+
+describe("scroll source extension", () => {
+  it("accepts legacy messages and preserves explicit operation sources", () => {
+    const legacy = { type: "pointerAxis", horizontal: 0.25, vertical: 10 }
+    expect(decodeToEngine(JSON.stringify(legacy))).toEqual(legacy)
+    for (const source of ["wheel", "continuous"]) {
+      const message = { ...legacy, source }
+      expect(decodeToEngine(JSON.stringify(message))).toEqual(message)
+    }
+    expect(() => decodeToEngine(JSON.stringify({ ...legacy, source: "guess" }))).toThrow(ProtocolError)
+  })
+})

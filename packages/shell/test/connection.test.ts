@@ -271,3 +271,33 @@ describe("an incompatible engine", () => {
     fetch.mockRestore()
   })
 })
+
+describe("additive scroll source negotiation", () => {
+  it("omits source metadata until the engine explicitly supports it", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ codecs: ["h264"] }))
+    try {
+      const conn = new Connection("ws://engine/engine?token=test", handlers())
+      conn.connect(); opened[0]!.accept()
+      conn.send({ type: "pointerAxis", horizontal: 0, vertical: 10, source: "wheel" })
+      expect(JSON.parse(opened[0]!.sent[0]!)).toEqual({ type: "pointerAxis", horizontal: 0, vertical: 10 })
+      conn.close()
+    } finally { fetch.mockRestore() }
+  })
+  it("preserves source changes after negotiation, then clears support on reconnect", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ pointerAxisSource: true }))
+    try {
+      const conn = new Connection("ws://engine", handlers())
+      conn.connect(); opened[0]!.accept()
+      await vi.waitFor(() => {
+        conn.send({ type: "pointerAxis", horizontal: 0, vertical: 10, source: "wheel" })
+        expect(JSON.parse(opened[0]!.sent.at(-1)!)).toMatchObject({ source: "wheel" })
+      })
+      conn.send({ type: "pointerAxis", horizontal: 0.1, vertical: 0.2, source: "continuous" })
+      expect(JSON.parse(opened[0]!.sent.at(-1)!)).toMatchObject({ source: "continuous" })
+      conn.connect(); opened[1]!.accept()
+      conn.send({ type: "pointerAxis", horizontal: 0, vertical: 10, source: "wheel" })
+      expect(JSON.parse(opened[1]!.sent.at(-1)!)).not.toHaveProperty("source")
+      conn.close()
+    } finally { fetch.mockRestore() }
+  })
+})
