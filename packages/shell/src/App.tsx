@@ -314,6 +314,7 @@ export function App(): React.ReactElement {
       const current = ++generation;
       void decodable().then((codecs) => {
         if (live && generation === current) {
+          log("info", `[hdr] available codecs=${codecs.join(",") || "JPEG"}`);
           availableCodecs.current = codecs;
           setDecodes(codecs.filter((codec) => !failedCodecs.current.has(codec)));
         }
@@ -339,6 +340,9 @@ export function App(): React.ReactElement {
     if (choice === "auto") return decodes;
     return decodes.filter((codec) => codec === choice);
   }, [streamPrefs.codec, decodes]);
+  useEffect(() => {
+    log("info", `[hdr] codec preference=${streamPrefs.codec}; requested=${wantCodecs.join(",") || "JPEG"}`);
+  }, [streamPrefs.codec, wantCodecs]);
   /**
    * Whether this connection decides layout.
    *

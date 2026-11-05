@@ -1,4 +1,5 @@
 import { supportsHdr, HDR_COLOR_SPACE } from "./hdr"
+import { log } from "./log"
 /**
  * Asking the browser what it can actually decode.
  *
@@ -144,8 +145,10 @@ export async function decodable(): Promise<Codec[]> {
       try {
         if (codec === "hevcHdr" && !(await supportsHdr())) return null
         const support = await decoder.isConfigSupported({ codec: PROBE[codec], ...PROBE_SIZE, ...(codec === "hevcHdr" ? { colorSpace: HDR_COLOR_SPACE } : {}) })
+        if (codec === "hevcHdr") log("info", `[hdr] Main10 decoder ${support.supported === true ? "supported" : "not supported"}`)
         return support.supported === true ? codec : null
-      } catch {
+      } catch (error) {
+        if (codec === "hevcHdr") log("warn", `[hdr] Main10 decoder probe failed: ${error instanceof Error ? error.message : String(error)}`)
         // A rejected promise means the configuration was not merely
         // unsupported but malformed for this implementation. Same outcome.
         return null

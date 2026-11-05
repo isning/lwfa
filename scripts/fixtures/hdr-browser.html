@@ -14,6 +14,37 @@ navigator.gpu.requestAdapter = async (...args) => {
   adapter.requestDevice = async (...args) => device = await requestDevice(...args);
   return adapter;
 };
+window.runNativeHdrProbe = async () => {
+  const { NativeHdrPresenter } = await import('/src/lib/native-hdr.ts');
+  const video = document.createElement('video'); document.body.append(video);
+  const presenter = new NativeHdrPresenter(video, reason => { throw Error(reason); });
+  const processor = new MediaStreamTrackProcessor({ track: video.srcObject.getVideoTracks()[0].clone() });
+  const reader = processor.readable.getReader();
+  let shownTimer;
+  const shown = new Promise((resolve,reject) => {
+    video.requestVideoFrameCallback(resolve);
+    shownTimer = setTimeout(()=>reject(Error('native HDR playback timeout')),5000);
+  });
+  const words = new Uint16Array(32*32*3/2); words.fill(723,0,32*32); words.fill(512,32*32);
+  const source = new VideoFrame(words, { format:'I420P10',codedWidth:32,codedHeight:32,timestamp:0,colorSpace:{primaries:'bt2020',transfer:'pq',matrix:'bt2020-ncl',fullRange:false} });
+  const received = reader.read();
+  try {
+    await presenter.draw(source); source.close();
+    const { value: frame } = await received;
+    try {
+      if (frame.format !== 'I420P10') throw Error('native stream lost 10-bit precision: '+frame.format);
+      const bytes = new Uint8Array(frame.allocationSize()); const layout = await frame.copyTo(bytes);
+      const samples = layout.map(p=>new DataView(bytes.buffer).getUint16(p.offset,true));
+      if (samples.join(',') !== '723,512,512') throw Error('native stream changed HDR samples: '+samples);
+      if (frame.colorSpace.transfer !== 'pq' || frame.colorSpace.primaries !== 'bt2020') throw Error('native stream lost HDR tags');
+      await shown; clearTimeout(shownTimer);
+      const displayed = new VideoFrame(video);
+      const colorSpace = displayed.colorSpace.toJSON(); displayed.close();
+      if (colorSpace.transfer !== 'pq' || colorSpace.primaries !== 'bt2020') throw Error('native playback lost HDR tags');
+      return { ok:true, samples, colorSpace, width:video.videoWidth, height:video.videoHeight };
+    } finally { frame.close(); }
+  } finally { clearTimeout(shownTimer); source.close(); await reader.cancel(); presenter.destroy(); video.remove(); }
+};
 window.runHdrProbe = async (failure = "device") => {
   if (!await supportsHdr()) throw Error('HDR pipeline unavailable');
   const canvas = document.querySelector('canvas');
@@ -36,7 +67,7 @@ window.runHdrProbe = async (failure = "device") => {
     words.fill(Math.round(64+876*y),0,4);
     words[4]=Math.round(512+896*(pq[2]-y)/1.8814);
     words[5]=Math.round(512+896*(pq[0]-y)/1.4746);
-    const video = new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+    const video = new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt2020',transfer:'pq',matrix:'bt2020-ncl',fullRange:false}});
     const frame = hdrFrame(video);
     await drawHdr(canvas,frame);
     const output = context.getCurrentTexture();
@@ -71,7 +102,7 @@ window.runHdrProbe = async (failure = "device") => {
   let copies=0;
   const jobs=[];
   for (let i=0;i<3;i++) {
-    const video=new VideoFrame(new Uint16Array([723,723,723,723,512,512]),{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:i,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+    const video=new VideoFrame(new Uint16Array([723,723,723,723,512,512]),{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:i,colorSpace:{primaries:'bt2020',transfer:'pq',matrix:'bt2020-ncl',fullRange:false}});
     const clone=video.clone.bind(video);
     video.clone=()=>{
       const owned=clone(),copy=owned.copyTo.bind(owned); clones.push(owned);
@@ -90,7 +121,7 @@ window.runHdrProbe = async (failure = "device") => {
   const oddTexture=device.createTexture({size:[3,3],format:'rgba16float',usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
   const oddWords=new Uint16Array(17); oddWords.fill(500,0,9);
   oddWords.set([512,550,512,550],9);oddWords.set([512,600,512,600],13);
-  const oddFrame=new VideoFrame(oddWords,{format:'I420P10',codedWidth:3,codedHeight:3,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+  const oddFrame=new VideoFrame(oddWords,{format:'I420P10',codedWidth:3,codedHeight:3,timestamp:0,colorSpace:{primaries:'bt2020',transfer:'pq',matrix:'bt2020-ncl',fullRange:false}});
   await oddUploader.draw(oddFrame,()=>oddTexture.createView(),()=>true);oddFrame.close();
   const oddRead=device.createBuffer({size:768,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
   const oddEncoder=device.createCommandEncoder();oddEncoder.copyTextureToBuffer({texture:oddTexture},{buffer:oddRead,bytesPerRow:256},[3,3]);device.queue.submit([oddEncoder.finish()]);
@@ -112,7 +143,7 @@ window.runHdrProbe = async (failure = "device") => {
   if (failure === "context") {
     const incompatible=document.createElement('canvas'); incompatible.getContext('2d');
     const words=new Uint16Array([723,723,723,723,512,512]);
-    const video=new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+    const video=new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt2020',transfer:'pq',matrix:'bt2020-ncl',fullRange:false}});
     await drawHdr(incompatible,hdrFrame(video)); video.close();
   } else { device.destroy(); await device.lost; await Promise.resolve(); }
   if (changes !== 1) throw Error('Capability change event missing');

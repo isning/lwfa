@@ -1,4 +1,5 @@
 import { sessionSocket, type SessionSocket } from "./lib/transport"
+import { log } from "./lib/log"
 /**
  * Authenticated session link to the engine, over QUIC or legacy WebSocket.
  *
@@ -432,6 +433,7 @@ export class Connection {
           } catch { /* An older engine has no feature endpoint: stay on SDR. */ }
           if (this.#socket !== socket || this.#closed) return
           this.#hdrSupport = supported
+          log("info", `[hdr] engine HDR capability ${supported ? "confirmed" : "unavailable; using SDR"}`)
           if (supported && this.#streams) this.send(this.#streams)
         })()
       }

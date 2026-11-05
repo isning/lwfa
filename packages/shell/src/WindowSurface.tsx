@@ -1,4 +1,5 @@
-import { drawHdr } from "@/lib/hdr"
+import { drawHdr, disableHdr } from "@/lib/hdr"
+import { NativeHdrPresenter, needsNativeHdr } from "@/lib/native-hdr"
 /**
  * One live window, composited in the DOM.
  *
@@ -164,6 +165,15 @@ export const WindowSurface = memo(function WindowSurface({
   // Subscribed per window, so a frame for another window does not re-render
   // this one. See lib/frames.ts.
   const frame = useFrame(id)
+  const nativeHdr = !!frame && "hdr" in frame && needsNativeHdr(frame.video)
+  const nativeVideo = useRef<HTMLVideoElement>(null)
+  const nativePresenter = useRef<NativeHdrPresenter | null>(null)
+  useEffect(() => {
+    if (!nativeHdr || !nativeVideo.current) return
+    try { nativePresenter.current = new NativeHdrPresenter(nativeVideo.current, disableHdr) }
+    catch (error) { disableHdr(String(error)) }
+    return () => { nativePresenter.current?.destroy(); nativePresenter.current = null }
+  }, [nativeHdr])
   const send = useCallback((event: SurfaceInput) => {
     if (event.kind === "motion" || event.kind === "touchDown" || event.kind === "touchMotion") {
       const size = contentSize()
@@ -239,7 +249,12 @@ export const WindowSurface = memo(function WindowSurface({
   }, [send])
 
   useEffect(() => {
-    if (!frame) return
+    if (!frame || frame.width === 0 || frame.height === 0) return
+    if (nativeHdr && "hdr" in frame) {
+      try { void nativePresenter.current?.draw(frame.video).catch(error => disableHdr(String(error))) }
+      catch (error) { disableHdr(String(error)) }
+      return
+    }
     const el = canvas.current
     if (!el) return
 
@@ -303,7 +318,7 @@ export const WindowSurface = memo(function WindowSurface({
         log(bad ? "warn" : "info", describe(label, reading))
       }
     }
-  }, [frame, label, rect])
+  }, [frame, label, rect, nativeHdr])
 
   return (
     <div
@@ -569,7 +584,9 @@ export const WindowSurface = memo(function WindowSurface({
         event.preventDefault()
       }}
     >
-      <canvas key={frame && "hdr" in frame ? "hdr" : "sdr"} ref={canvas} className="block h-full w-full" />
+      {nativeHdr
+        ? <video ref={nativeVideo} autoPlay muted playsInline className="pointer-events-none block h-full w-full object-fill" />
+        : <canvas key={frame && "hdr" in frame ? "hdr" : "sdr"} ref={canvas} className="block h-full w-full" />}
       {/*
         * No "paused" badge for unfocused windows on purpose. With
         * pause-inactive on, a frozen side window is the normal state of the

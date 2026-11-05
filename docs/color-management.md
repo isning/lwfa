@@ -100,7 +100,10 @@ BT.709 while keeping the real BT.2020 limited-range YUV matrix. Importing into
 sRGB then applying its inverse transfer recovers the PQ RGB code values; our
 shader applies PQ EOTF, BT.2020 → P3 conversion and extended sRGB encoding at
 203-nit white. This avoids browser-dependent PQ import tone mapping. These
-internal frames must never enter ordinary image/Canvas2D paths.
+internal frames must never enter ordinary image/Canvas2D paths. The synthetic
+linear-container requirement applies only to external import. Decoders returning
+the original PQ/BT.2020 labels use the verified raw 10-bit plane path when
+available; plane reads do not apply color-space conversions based on labels.
 
 Capability negotiation reads back both a 1000-nit gray and saturated blue from
 the actual pipeline. It compares all RGB components with references derived
@@ -109,9 +112,30 @@ misinterprets the matrix instead copy the original 10-bit YUV planes, upload
 three `r16uint` textures and perform YUV/PQ/P3 conversion in WGSL. This fallback
 copies raw plane bytes on the browser CPU; it never converts through RGB8.
 The queue retains one active copy plus one latest frame, closes replaced frames,
-and owns a clone so decoder frames may be closed immediately. Unsupported plane
-access or operational failures downgrade to SDR. `hdrPresentationPath()` reports
-which verified path is active. No SDR ImageBitmap intermediate is used. Ordinary SDR/JPEG frames keep the 2D canvas path.
+and owns a clone so decoder frames may be closed immediately.
+
+Some hardware decoders expose opaque GPU frames (`format=null`) with original
+PQ/BT.2020 metadata. Where `MediaStreamTrackGenerator` is available, these frames
+use a native `<video>` element per window. The generator receives a reference to
+the original frame with an arrival-time timestamp; no CPU pixel read, external
+texture import or RGB8 conversion is involved. This lets the browser's native HDR
+video compositor handle the display. The first write waits a task for the video
+sink to attach. Each presenter retains at most one write and one latest frame;
+replacement closes queued frames, and unmount stops the track and clears the
+media source. The window's existing logical input coordinates still apply.
+
+Unsupported opaque frames or operational failures downgrade to SDR. The native
+path requires the original PQ/BT.2020, limited-range BT.2020-NCL metadata; a
+synthetic linear container is never sent to native video playback.
+`hdrPresentationPath()` describes the verified WebGPU candidate; `[hdr]` log
+entries identify when an actual decoder requires native video presentation.
+No SDR ImageBitmap intermediate is used. Ordinary SDR/JPEG frames keep the 2D
+canvas path.
+
+Session → Log records `[hdr]` entries for display/presentation probe failures,
+Main10 decoder support, the requested codec preference and engine HDR capability.
+Use these entries to distinguish a safe SDR fallback from HDR content that has
+already been tone-mapped by the source application.
 
 HDR is selected through the Auto codec preference. Pinning HEVC or H.264 selects
 the existing SDR formats. HTTPS/secure-context requirements still apply.
@@ -132,7 +156,7 @@ require drivers and are ignored in the ordinary Rust suite:
 
 ```sh
 env -u DISPLAY -u WAYLAND_DISPLAY cargo test -p lwfa-engine color_render::tests -- --ignored
-cargo test -p lwfa-engine source_color_changes_force_a_new_hdr_keyframe -- --ignored
+cargo test -p lwfa-engine only_output_metadata_changes_force_a_new_hdr_keyframe -- --ignored
 cargo test -p lwfa-engine packed_planes_preserve_pq -- --ignored
 # Requires NVIDIA GLES, libcuda and NVENC; asserts that fallback did not occur:
 cargo test -p lwfa-engine gpu_p010_matches_readback -- --ignored
@@ -195,9 +219,14 @@ NVIDIA EGL vendor and `/run/opengl-driver/lib` are visible to the test process.
 Serve `scripts/fixtures/hdr-browser.html` through the shell's Vite server (the
 fixture imports `/src/lib/hdr.ts`) and invoke `window.runHdrProbe()`. This uses
 real WebGPU and 10-bit planar VideoFrames, checks float samples at 203/1000/4000
-cd/m² and verifies downgrade. It **emulates** HDR display detection, so passing
+cd/m² and verifies downgrade. The fixture uses PQ/BT.2020-tagged frames to exercise
+hardware-decoder-style output as well as the synthetic capability probe.
+It **emulates** HDR display detection, so passing
 proves numeric presentation, not physical monitor appearance. A real HDR display,
 OS/browser HDR configuration and supported Main10 decoder remain required for
-user-visible HDR. The probe rejects lossy external imports in favor of exact plane upload, but
+user-visible HDR. `window.runNativeHdrProbe()` separately verifies 10-bit sample
+preservation through a generated video track and PQ/BT.2020 metadata at the native
+video element. This verifies data flow, not physical monitor brightness.
+The probe rejects lossy external imports in favor of exact plane upload, but
 production acceptance must still include the target browser's actual hardware
 decoder, which may expose different frame formats and resource behavior.

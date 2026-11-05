@@ -1,6 +1,7 @@
 /// <reference types="@webgpu/types" />
 import { HDR_SHADER } from "./hdr-shader"
 import { HdrPlanes } from "./hdr-planes"
+import { log } from "./log"
 /** HDR presentation stays in 10-bit/float precision, including planar upload
  * when external texture import fails the numeric color/precision probe.
  * ImageBitmap/8-bit 2D intermediates would discard highlights. */
@@ -19,6 +20,8 @@ let initializing: Promise<boolean> | null = null
 let failed = false
 let externalImport = false
 let planesPipeline: GPURenderPipeline | null = null
+let planesInitializing: Promise<void> | null = null
+let observedDecoderFrame = false
 const planePresenters = new WeakMap<HTMLCanvasElement, HdrPlanes>()
 const contexts = new WeakMap<HTMLCanvasElement, GPUCanvasContext>()
 const shader = `
@@ -36,30 +39,51 @@ ${HDR_SHADER}
 }`
 let sampler: GPUSampler | null = null
 
-export function disableHdr(): void {
+let lastDiagnostic = ""
+function diagnostic(message: string): false {
+  if (message !== lastDiagnostic) {
+    lastDiagnostic = message
+    console.info(`[hdr] ${message}`)
+    log("info", `[hdr] ${message}`)
+  }
+  return false
+}
+function detail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+export function disableHdr(reason = "presentation device became unavailable"): void {
   if (failed) return
   failed = true
+  diagnostic(`disabled: ${reason}`)
   window.dispatchEvent(new Event(HDR_CHANGED))
 }
 
 /** Recheck the display on every negotiation, rather than caching an HDR screen. */
 export async function supportsHdr(): Promise<boolean> {
-  if (failed || typeof window === "undefined" || typeof navigator === "undefined"
-      || !window.matchMedia?.("(dynamic-range: high)").matches || !navigator.gpu) return false
+  if (typeof window === "undefined" || typeof navigator === "undefined") return false
+  if (failed) return false
+  if (!window.matchMedia?.("(dynamic-range: high)").matches) return diagnostic("SDR: display does not report HDR")
+  if (!navigator.gpu) return diagnostic("SDR: WebGPU unavailable")
   initializing ??= (async () => {
+    let stage = "request adapter"
     try {
       const adapter = await navigator.gpu.requestAdapter()
-      if (!adapter) return false
+      if (!adapter) return diagnostic("SDR: no WebGPU adapter")
+      stage = "request device"
       device = await adapter.requestDevice()
       const canvas = document.createElement("canvas")
       const context = canvas.getContext("webgpu")
-      if (!context) return false
+      if (!context) return diagnostic("SDR: WebGPU canvas unavailable")
+      stage = "configure extended float canvas"
       device.pushErrorScope("validation")
       context.configure({ device, format: "rgba16float", colorSpace: "display-p3", toneMapping: { mode: "extended" }, alphaMode: "opaque" })
       const configuration = context.getConfiguration()
       const error = await device.popErrorScope()
       context.unconfigure()
-      if (error || configuration?.toneMapping?.mode !== "extended" || configuration.format !== "rgba16float") return false
+      if (error) return diagnostic(`SDR: extended float canvas: ${error.message}`)
+      if (configuration?.toneMapping?.mode !== "extended" || configuration.format !== "rgba16float") return diagnostic("SDR: browser did not accept extended float canvas")
+      stage = "compile external-texture shader"
       pipeline = await device.createRenderPipelineAsync({
         layout: "auto", vertex: { module: device.createShaderModule({ code: shader }), entryPoint: "vs" },
         fragment: { module: device.createShaderModule({ code: shader }), entryPoint: "fs", targets: [{ format: "rgba16float" }] },
@@ -69,16 +93,15 @@ export async function supportsHdr(): Promise<boolean> {
       try { externalImport = await probeImport((video,view) => render(video,view)) }
       catch { externalImport = false }
       if (!externalImport) {
-        planesPipeline = await HdrPlanes.pipeline(device)
-        const planes = new HdrPlanes(device,planesPipeline)
-        try { if (!await probeImport((video,view) => planes.draw(video,()=>view,()=>true))) return false }
-        finally { planes.destroy() }
+        stage = "10-bit plane precision probe"
+        await preparePlanes()
         console.info("HDR uses exact 10-bit plane upload: external import failed its color/precision probe")
       }
-      void device.lost.then(disableHdr)
-      device.addEventListener("uncapturederror", disableHdr)
+      void device.lost.then((info) => disableHdr(`device lost: ${info.message}`))
+      device.addEventListener("uncapturederror", (event) => disableHdr(event.error.message))
+      diagnostic(`presentation ready (${externalImport ? "external texture" : "10-bit planes"})`)
       return true
-    } catch { return false }
+    } catch (error) { return diagnostic(`SDR: ${stage}: ${detail(error)}`) }
   })()
   return initializing
 }
@@ -86,7 +109,20 @@ export async function supportsHdr(): Promise<boolean> {
 export async function drawHdr(canvas: HTMLCanvasElement, frame: HdrFrame): Promise<void> {
   if (!device || !pipeline || !sampler || failed) { disableHdr(); return }
   try {
-    if (String(frame.video.colorSpace.transfer) !== "linear" || frame.video.colorSpace.primaries !== "bt709") throw new Error("decoder did not preserve the HDR sample container")
+    const color = frame.video.colorSpace
+    if (!observedDecoderFrame) {
+      observedDecoderFrame = true
+      log("info", `[hdr] decoded frame: format=${frame.video.format}; primaries=${color.primaries}; transfer=${color.transfer}; matrix=${color.matrix}; fullRange=${color.fullRange}`)
+    }
+    // Only the external importer relies on the synthetic linear container.
+    // Raw-plane reads preserve the encoded YUV samples regardless of labels.
+    // Hardware decoders may return the bitstream's PQ/BT.2020 labels instead.
+    if (externalImport && (String(color.transfer) !== "linear" || color.primaries !== "bt709"
+        || String(color.matrix) !== "bt2020-ncl" || color.fullRange !== false)) {
+      await preparePlanes()
+      externalImport = false
+      diagnostic("decoder uses verified 10-bit planes; external-import container labels differ")
+    }
     let context = contexts.get(canvas)
     if (!context) {
       context = canvas.getContext("webgpu") ?? undefined
@@ -102,7 +138,22 @@ export async function drawHdr(canvas: HTMLCanvasElement, frame: HdrFrame): Promi
       const target = context
       await presenter.draw(frame.video,()=>target.getCurrentTexture().createView(),()=>!failed)
     }
-  } catch { disableHdr() }
+  } catch (error) { disableHdr(detail(error)) }
+}
+
+async function preparePlanes(): Promise<void> {
+  if (!device) throw new Error("HDR device unavailable")
+  const currentDevice = device
+  planesInitializing ??= (async () => {
+    planesPipeline = await HdrPlanes.pipeline(currentDevice)
+    const planes = new HdrPlanes(currentDevice, planesPipeline)
+    try {
+      if (!await probeImport((video, view) => planes.draw(video, () => view, () => true))) {
+        throw new Error("10-bit plane precision probe failed")
+      }
+    } finally { planes.destroy() }
+  })()
+  return planesInitializing
 }
 
 function render(video: VideoFrame, view: GPUTextureView): void {
@@ -142,7 +193,7 @@ async function probeImport(draw: (video: VideoFrame, view: GPUTextureView) => vo
       for (let channel=0;channel<3;channel++) {
         const word=pixel[channel]!, sign=word&0x8000?-1:1, exponent=(word>>10)&31, fraction=word&1023
         const value=sign*(exponent === 0 ? fraction*2**-24 : (1+fraction/1024)*2**(exponent-15))
-        if (!Number.isFinite(value) || Math.abs(value-expected![channel]!)>0.006) return false
+        if (!Number.isFinite(value) || Math.abs(value-expected![channel]!)>0.006) throw new Error(`precision mismatch channel ${channel}: got ${value}, expected ${expected![channel]!}`)
       }
     } finally { video.close(); buffer.destroy(); texture.destroy() }
   }
