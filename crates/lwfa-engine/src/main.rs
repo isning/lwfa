@@ -43,6 +43,7 @@ mod color_management;
 mod color_render;
 mod hdr_gpu;
 mod hdr_metadata;
+mod hdr_chroma;
 mod dmabuf;
 mod source_reads;
 mod output;

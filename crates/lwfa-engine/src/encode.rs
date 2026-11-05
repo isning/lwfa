@@ -53,6 +53,7 @@ pub struct EncodedFrame {
 struct Session {
     color_generation: u64,
     hdr_peak: f32,
+    chroma: Option<crate::hdr_chroma::CenterChroma>,
     /// Which codec this session encodes, so frames can be labelled.
     codec: lwfa_proto::Codec,
     /// The rate it was built with, so a changed share can be noticed.
@@ -447,7 +448,9 @@ impl Session {
         // milliseconds on the dedicated encoder thread, which the zero-copy
         // path has left mostly idle, and spends the same bits far better.
         opts.set("preset", "p4");
-        if frame.hdr { opts.set("profile", "main10"); }
+        if frame.hdr {
+            opts.set("profile", "main10");
+        }
         opts.set("tune", "ull"); // ultra low latency
         opts.set("zerolatency", "1");
         opts.set("delay", "0");
@@ -465,11 +468,13 @@ impl Session {
         opts.set("forced-idr", "1");
 
         let encoder = enc.open_with(opts)?;
+        let chroma = if frame.hdr { Some(crate::hdr_chroma::CenterChroma::new(&encoder)?) } else { None };
 
         Ok(Self {
             encoder,
             color_generation: frame.color_generation,
             hdr_peak: frame.hdr_peak,
+            chroma,
             width,
             height,
             codec: wanted,
@@ -504,10 +509,12 @@ impl Session {
         let mut keyframe = false;
         let mut packet = ff::Packet::empty();
         while self.encoder.receive_packet(&mut packet).is_ok() {
-            if let Some(data) = packet.data() {
+            keyframe |= packet.is_key();
+            if let Some(chroma) = self.chroma.as_mut() {
+                bytes.extend_from_slice(&chroma.packet(&mut packet).inspect_err(|error| tracing::warn!(?error,"HDR chroma metadata filter failed")).ok()?);
+            } else if let Some(data) = packet.data() {
                 bytes.extend_from_slice(data);
             }
-            keyframe |= packet.is_key();
         }
 
         if bytes.is_empty() {

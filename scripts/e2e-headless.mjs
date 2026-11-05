@@ -130,6 +130,7 @@ async function verifyStream(connection, id, filename, expectedHdr = hdrOutput, c
     assert.equal(stream.color_transfer, "smpte2084")
     assert.equal(stream.color_space, "bt2020nc")
     assert.equal(stream.color_range, "tv")
+    assert.equal(stream.chroma_location, "center")
   }
   const decoded = spawnSync(process.env.LWFA_TEST_FFMPEG ?? "ffmpeg", ["-v", "error", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"], { maxBuffer: 2 * 1024 * 1024 })
   assert.equal(decoded.status, 0, decoded.stderr?.toString())
