@@ -1,12 +1,15 @@
+import { MediaDatagrams, FRAME_LIFETIME_MS } from "./mediaDatagrams"
 /** Session transport. The compositor protocol is identical on either adapter. */
 export interface SessionSocket {
   readonly readyState: number
   readonly transport?: "websocket" | "webtransport"
+  readonly media?: "stream" | "datagram"
   binaryType: BinaryType
   onopen: (() => void) | null
   onmessage: ((event: { data: unknown }) => void) | null
   onclose: ((event: { reason: string; code: number }) => void) | null
   onerror: (() => void) | null
+  setWindows?(windows: readonly number[]): void
   send(data: string): void
   close(): void
 }
@@ -16,11 +19,17 @@ interface QuicSession {
   closed: Promise<{ closeCode: number; reason: string }>
   createBidirectionalStream(): Promise<{ readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> }>
   incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>
+  datagrams?: {
+    readable: ReadableStream<Uint8Array>
+    incomingMaxAge: number
+    incomingHighWaterMark: number
+  }
   close(): void
 }
 export type QuicConstructor = new (url: string, options?: {
   serverCertificateHashes?: { algorithm: string; value: Uint8Array }[]
   congestionControl?: string
+  requireUnreliable?: boolean
 }) => QuicSession
 
 const MAX_CONTROL = 4 * 1024 * 1024
@@ -108,6 +117,9 @@ class QuicSocket implements SessionSocket {
   #writes: Promise<void> = Promise.resolve()
   #queued = 0
   #lanes = 0
+  media: "stream" | "datagram" = "stream"
+  #packets: MediaDatagrams | null = null
+  #expiry: ReturnType<typeof setInterval> | null = null
   #abort = new AbortController()
   constructor(private url: string, private ctor: QuicConstructor) { void this.#start() }
 
@@ -122,7 +134,7 @@ class QuicSocket implements SessionSocket {
       const body: unknown = response.ok ? await response.json() : null
       if (this.readyState === 3) return
       const info = body && typeof body === "object" && "webtransport" in body ? body.webtransport : null
-      if (!info || typeof info !== "object" || !("version" in info) || info.version !== 1) { this.#fallback(); return }
+      if (!info || typeof info !== "object" || !("version" in info) || (info.version !== 1 && info.version !== 2)) { this.#fallback(); return }
       advertised = true
       if (!("port" in info) || typeof info.port !== "number" || !Number.isInteger(info.port) || info.port < 1 || info.port > 65535) throw new Error("invalid QUIC discovery port")
       const hash = "certificateHash" in info ? info.certificateHash : null
@@ -134,6 +146,7 @@ class QuicSocket implements SessionSocket {
       const session = new this.ctor(endpoint.toString(), {
         ...(Array.isArray(hash) ? { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(hash) }] } : {}),
         congestionControl: "low-latency",
+        requireUnreliable: info.version === 2,
       })
       this.#session = session
       // Attach rejection handling immediately, including handshake failures.
@@ -147,13 +160,29 @@ class QuicSocket implements SessionSocket {
       this.#writer = stream.writable.getWriter()
       // Opening a QUIC stream alone need not send it: write a version preface
       // so the engine can accept it and send Hello before any app messages.
-      await this.#writer.write(packet(new Uint8Array([2, 1])))
+      this.media = info.version === 2 ? "datagram" : "stream"
+      if (this.media === "datagram") {
+        if (!session.datagrams) throw new Error("browser has no unreliable datagrams")
+        session.datagrams.incomingMaxAge = FRAME_LIFETIME_MS
+        session.datagrams.incomingHighWaterMark = 2048
+      }
+      await this.#writer.write(packet(new Uint8Array([2, info.version])))
       if (this.readyState === 3) return
       this.readyState = 1
-      console.info("LWFA transport: WebTransport / QUIC (UDP)")
+      console.info(`LWFA transport: WebTransport / QUIC ${this.media === "datagram" ? "datagrams" : "streams"} (UDP)`)
       this.onopen?.()
       void this.#control(stream.readable).catch(() => this.#end("control stream failed", 1006))
-      void this.#media(session.incomingUnidirectionalStreams).catch(() => this.#end("media stream failed", 1006))
+      if (this.media === "datagram") {
+        this.#packets = new MediaDatagrams(
+          (data) => { if (this.readyState === 1) this.onmessage?.({ data }) },
+          (sequence) => this.#feedback(1, sequence),
+          (window) => this.#feedback(3, window),
+        )
+        this.#expiry = setInterval(() => this.#packets?.expire(performance.now()), 25)
+        void this.#datagrams(session.datagrams!.readable).catch(() => this.#end("media datagrams failed", 1006))
+      } else {
+        void this.#media(session.incomingUnidirectionalStreams).catch(() => this.#end("media stream failed", 1006))
+      }
     } catch (error) {
       if (this.readyState === 3) return
       if (!advertised) {
@@ -224,6 +253,24 @@ class QuicSocket implements SessionSocket {
     }
   }
 
+  async #datagrams(readable: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = readable.getReader()
+    while (this.readyState === 1) {
+      const next = await reader.read()
+      if (next.done) return
+      if (this.readyState === 1) this.#packets?.receive(next.value, performance.now())
+    }
+  }
+  setWindows(windows: readonly number[]): void {
+    this.#packets?.setWindows(windows.map((id) => BigInt(id)), performance.now())
+  }
+  #feedback(kind: number, value: bigint): void {
+    const bytes = new Uint8Array(9)
+    bytes[0] = kind
+    new DataView(bytes.buffer).setBigUint64(1, value)
+    this.#write(bytes)
+  }
+
   #write(bytes: Uint8Array): void {
     if (this.readyState !== 1) return
     if (bytes.length > MAX_CONTROL || this.#queued + bytes.length > MAX_CONTROL) { this.#end("control queue overflow", 1006); return }
@@ -244,6 +291,8 @@ class QuicSocket implements SessionSocket {
     if (this.readyState === 3) return
     this.readyState = 3
     this.#abort.abort()
+    if (this.#expiry !== null) clearInterval(this.#expiry)
+    this.#packets?.clear()
     this.#session?.close()
     this.#legacy?.close()
     this.onclose?.({ reason, code })

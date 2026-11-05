@@ -299,7 +299,7 @@ export class Connection {
 
       if (message.type === "hello") {
         this.#everGreeted = true
-        this.#handlers.onStatus("connected", socket.transport === "webtransport" ? "WebTransport (QUIC/UDP)" : "WebSocket (TCP)")
+        this.#handlers.onStatus("connected", socket.transport === "webtransport" ? (socket.media === "datagram" ? "WebTransport (QUIC datagrams)" : "WebTransport (QUIC streams)") : "WebSocket (TCP)")
       }
 
       this.#handlers.onMessage(message)
@@ -392,6 +392,7 @@ export class Connection {
   send(message: ToEngine): void {
     if (this.#socket?.readyState !== WebSocket.OPEN) return
     if (message.type === "setStreams") {
+      this.#socket.setWindows?.(message.windows)
       this.#streams = message
       if (message.codecs.includes("hevcHdr") && this.#hdrSupport === undefined && !this.#hdrProbe) {
         const socket = this.#socket

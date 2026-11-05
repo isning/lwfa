@@ -111,3 +111,52 @@ it("does not conceal advertised QUIC failures behind a TCP fallback", async () =
   expect(socket.readyState).toBe(3)
   expect(legacy).not.toHaveBeenCalled()
 })
+
+it("uses datagrams for v2 media and reliable feedback for reference recovery", async () => {
+  const writes: Uint8Array[] = []
+  let input!: ReadableStreamDefaultController<Uint8Array>
+  let control!: ReadableStreamDefaultController<Uint8Array>
+  const datagrams = {
+    incomingMaxAge: 0, incomingHighWaterMark: 0,
+    readable: new ReadableStream<Uint8Array>({ start(c) { input = c } }),
+  }
+  const ctor = vi.fn(function () {
+    return {
+      ready: Promise.resolve(), closed: new Promise(() => {}), close: vi.fn(), datagrams,
+      createBidirectionalStream: async () => ({
+        readable: new ReadableStream({ start(c) { control = c } }),
+        writable: new WritableStream({ write(bytes) { writes.push(bytes) } }),
+      }),
+      get incomingUnidirectionalStreams() { throw new Error("v2 must never read reliable media streams") },
+    }
+  })
+  vi.stubGlobal("WebTransport", ctor)
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ webtransport: { version: 2, port: 6734, certificateHash: null } }) })))
+  const socket = sessionSocket("wss://desktop.test/engine")
+  const messages: unknown[] = []
+  socket.onmessage = ({ data }) => messages.push(data)
+  await new Promise<void>((resolve) => { socket.onopen = resolve })
+  expect(socket.media).toBe("datagram")
+  expect(writes[0]).toEqual(packet(new Uint8Array([2, 2])))
+  expect(datagrams.incomingMaxAge).toBe(150)
+  function media(sequence: number, key: boolean): Uint8Array {
+    const out = new Uint8Array(48 + 25), v = new DataView(out.buffer)
+    out.set([76,87,70,68,1,1,key ? 1 : 0,0])
+    v.setBigUint64(8, BigInt(sequence)); v.setBigUint64(16, 1n); v.setBigUint64(24, BigInt(sequence))
+    v.setUint32(32, 25); v.setUint16(38, 1); v.setUint16(40, 25)
+    out.set([76,87,70,65,0,1,key ? 1 : 0,0],48)
+    v.setBigUint64(56, 1n, true); v.setUint32(64,2,true); v.setUint32(68,2,true)
+    out[72] = sequence
+    return out
+  }
+  input.enqueue(media(1, true))
+  await vi.waitFor(() => expect(messages.length).toBe(1))
+  // Frame 2 vanishes entirely. The next delta is withheld until a new IDR.
+  input.enqueue(media(3, false))
+  await vi.waitFor(() => expect(writes.some((b) => b[4] === 3)).toBe(true))
+  expect(messages.length).toBe(1)
+  input.enqueue(media(4, true))
+  await vi.waitFor(() => expect(messages.length).toBe(2))
+  expect(new Uint8Array(messages[1] as ArrayBuffer)[24]).toBe(4)
+  socket.close(); input.close(); control.close()
+})

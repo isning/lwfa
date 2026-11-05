@@ -146,7 +146,7 @@ enum Outgoing {
     Control(tungstenite::Utf8Bytes),
     /// An encoded video frame, header included. `Bytes`, so the fan-out
     /// to several watching devices clones a reference count, not megabytes.
-    Frame(tungstenite::Bytes),
+    Frame(tungstenite::Bytes, u64),
     /// A chunk of audio. Separate from [`Outgoing::Frame`] because the two
     /// are accounted separately; see [`Slot::audio_in_flight`].
     Audio(tungstenite::Bytes),
@@ -324,6 +324,7 @@ pub struct Clients {
     /// matters here.
     wake: OwnedFd,
     quic_wake: tokio::sync::Notify,
+    frame_sequences: Mutex<std::collections::HashMap<WindowId, u64>>,
 }
 
 impl Clients {
@@ -336,6 +337,7 @@ impl Clients {
             next_id: AtomicU64::new(1),
             wake,
             quic_wake: tokio::sync::Notify::new(),
+            frame_sequences: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -420,6 +422,11 @@ impl Clients {
 
     /// Queue a control message for everyone.
     pub fn broadcast(&self, message: ToShell) {
+        if let ToShell::WindowClosed { id } = &message
+            && let Ok(mut sequences) = self.frame_sequences.lock()
+        {
+            sequences.remove(id);
+        }
         let Some(json) = control(&message) else { return };
         let Ok(slots) = self.slots.lock() else { return };
         for slot in slots.iter().filter(|s| s.alive()) {
@@ -624,6 +631,15 @@ impl FrameSink {
     /// encoding per client would cost an NVENC session each, and there are
     /// only eight.
     pub fn send_frame(&self, window: WindowId, bytes: Vec<u8>) {
+        // Number before per-client fan-out: a client skipped by backpressure
+        // must observe a reference gap in the next predictive frame.
+        let sequence = {
+            let Ok(mut sequences) = self.clients.frame_sequences.lock() else { return };
+            let next = sequences.entry(window).or_insert(0);
+            let Some(value) = next.checked_add(1) else { return };
+            *next = value;
+            value
+        };
         let bytes = tungstenite::Bytes::from(bytes);
         let Ok(slots) = self.clients.slots.lock() else {
             return;
@@ -648,7 +664,7 @@ impl FrameSink {
             }
             slot.in_flight.fetch_add(1, Ordering::Relaxed);
             slot.in_flight_bytes.fetch_add(size, Ordering::Relaxed);
-            if slot.outgoing.send(Outgoing::Frame(bytes.clone())).is_err() {
+            if slot.outgoing.send(Outgoing::Frame(bytes.clone(), sequence)).is_err() {
                 slot.in_flight.fetch_sub(1, Ordering::Relaxed);
                 slot.in_flight_bytes.fetch_sub(size, Ordering::Relaxed);
             }
@@ -1753,7 +1769,7 @@ fn pump(client: &mut Live, events: &LoopSender<ShellEvent>) -> bool {
                 // delivery. See `Live::unacked_video`.
                 let frame = match outbound {
                     Outgoing::Control(json) => tungstenite::Message::Text(json),
-                    Outgoing::Frame(bytes) => {
+                    Outgoing::Frame(bytes, _) => {
                         client.unacked_video += 1;
                         client.unacked_bytes += bytes.len();
                         tungstenite::Message::Binary(bytes)
@@ -2133,8 +2149,25 @@ pub(crate) mod tests {
         let bytes = lwfa_proto::FrameHeader { window: WindowId(1), width: 320, height: 240,
             format: lwfa_proto::FrameFormat::HevcHdr, keyframe: true }.encode_with_payload(&[1,2,3]);
         FrameSink { clients }.send_frame(WindowId(1),bytes);
-        assert!(matches!(hdr_rx.try_recv(),Ok(Outgoing::Frame(_))));
+        assert!(matches!(hdr_rx.try_recv(),Ok(Outgoing::Frame(_, _))));
         assert!(sdr_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn skipped_client_frames_leave_a_reference_sequence_gap() {
+        let wake = rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap();
+        let clients = Arc::new(Clients::new(1, wake));
+        let (slot, incoming) = Slot::create(1);
+        clients.add(slot.clone());
+        clients.set_streams(1, HashSet::from([WindowId(1)]));
+        let sink = FrameSink { clients };
+        sink.send_frame(WindowId(1), vec![1]);
+        sink.send_frame(WindowId(1), vec![2]); // dropped by the per-client budget
+        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 1))));
+        slot.in_flight.store(0, Ordering::Relaxed);
+        slot.in_flight_bytes.store(0, Ordering::Relaxed);
+        sink.send_frame(WindowId(1), vec![3]);
+        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 3))));
     }
 
     fn test_slot() -> Slot {

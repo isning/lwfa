@@ -46,7 +46,7 @@ calloop = { version = "0.14", features = ["signals"] }
 tungstenite = "0.30.0"
 
 # QUIC sessions run outside the compositor event loop.
-wtransport = "0.7.2"
+wtransport = { version = "0.7.2", features = ["quinn"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time", "macros"] }
 
 # Only the two codecs lwfa actually uses. PNG for the debug capture dump

@@ -59,73 +59,126 @@ certificates and restart the engine before they expire.
 
 ## Wire layout and ordering
 
-A session first authenticates `/session?token=…&client=…&device=…` using the same
-owner/account lookup as WebSocket. A client opens exactly one bidirectional
-control stream and writes its version preface. Control packets have a four-byte
-big-endian length and a one-byte kind:
+Version 2 uses **unreliable datagrams for video and audio**, with a reliable
+bidirectional control stream. The browser requires an unreliable-capable
+transport (`requireUnreliable: true`). The native server speaks HTTP/3/QUIC;
+there is no TCP fallback hidden inside the v2 media path.
+
+A session authenticates `/session?token=…&client=…&device=…` using the existing
+owner/account lookup. The client opens one control stream. Each client control
+packet has a four-byte big-endian length and a one-byte kind:
 
 - `0`: UTF-8 JSON `ToEngine` message.
-- `1`: eight-byte big-endian media sequence acknowledgement.
-- `2`: one-byte transport version, currently `1` (the opening preface).
+- `1`: eight-byte big-endian media disposition sequence (read or retired).
+- `2`: one-byte transport version, currently `2` (the opening preface).
+- `3`: eight-byte window ID requesting a **new** independently decodable frame.
 
-Server control packets are length-prefixed UTF-8 JSON `ToShell` messages.
-The server opens independent unidirectional streams for each window and audio.
-Each starts with one byte (`1` video, `2` audio), followed by length-prefixed
-packets containing an eight-byte big-endian sequence and the unchanged binary
-LWFA video/audio packet. Media sequences are session-wide, not codec timestamps.
+Server control packets remain length-prefixed UTF-8 JSON `ToShell` messages.
+A media datagram contains a 48-byte header followed by one fragment:
 
-Frames remain reliable and ordered **within each window**. This preserves
-predictive codec references. A window's lost packet does not cause stream
-head-of-line blocking in another window, audio, or control. All streams still
-share the QUIC connection's congestion controller and available link capacity.
-This implementation does not use datagrams, cancel stale predicted frames, or
-remove the retransmission dependency within a window. Doing that requires
-explicit frame dependency/recovery handling. It does not promise Moonlight
-latency or quality merely by changing protocols.
+| Bytes | Meaning |
+| --- | --- |
+| 0–3 | ASCII `LWFD` |
+| 4 | Fragment format version `1` |
+| 5 | Kind: `1` video, `2` audio |
+| 6 | Independent frame flag (IDR or JPEG); audio sets it too |
+| 7 | Reserved, zero |
+| 8–15 | Session-wide media packet sequence, big-endian u64 |
+| 16–23 | Window ID, or zero for audio, big-endian u64 |
+| 24–31 | Per-window encoded-frame sequence, big-endian u64 |
+| 32–35 | Full media payload size, big-endian u32 |
+| 36–37 | Fragment index, big-endian u16 |
+| 38–39 | Fragment count, big-endian u16 |
+| 40–41 | Fragment stride, big-endian u16 |
+| 42–47 | Reserved, zero |
 
-## Queues, recovery and limits
+The assembled payload is the unchanged binary LWFA frame/audio packet.
+Packet IDs identify transmission attempts, not decoder timestamps. Video frame
+sequences are assigned **before** per-client fan-out, so a frame skipped for a
+slow viewer leaves a detectable reference gap. Datagram payloads are at most
+1200 bytes and never exceed the negotiated WebTransport datagram limit.
 
-The existing per-client frame/byte and audio budgets remain in force. A media
-packet counts until the browser has read it and acknowledged its sequence;
-merely copying into QUIC's send buffer does not release the budget. The server
-tracks byte counts itself and rejects unknown/duplicate acknowledgements.
-The acknowledgement confirms reading, not successful decoding or display.
+## Loss, deadlines and recovery
 
-QUIC RTT samples feed the existing rolling-baseline delay estimate. Browser
-media-read acknowledgements supply backpressure; no WebSocket ping through the
-HTTPS proxy is used to estimate the QUIC path. The existing bitrate controller
-still chooses the encoder budget. Encoder quality, chroma subsampling, browser
-scaling and that controller can still affect image quality.
+No media fragment is retransmitted, and media bytes never travel on the control
+stream. Audio chunks can skip missing or obsolete chunks. JPEG and IDR video
+frames are self-contained and can advance past a gap. Predictive H.264/HEVC
+deltas are submitted only in contiguous encoded-frame order.
 
-Resource bounds are 8 registered sessions across both transports, 16 concurrent
-QUIC handshake/session tasks, 128 media lanes per session lifetime, 4 MiB control
-packets, 32 MiB media payloads, and 5-second media acknowledgement/write deadlines.
-The opening handshake/control stream also has a 5-second deadline. A failed or
-stalled stream closes its session, releases held input via normal disconnect
-handling, and lets the existing shell reconnect logic re-establish the session
-and codec state. Exceeding the lane lifetime bound also reconnects; a later
-implementation can retire closed-window lanes without that reconnect.
+The receiver allows brief reordering. Incomplete video frames and deltas held
+behind a gap expire after 150 ms from their first received fragment; audio
+partials expire after 60 ms. A lost reference invalidates dependent deltas.
+The client requests a fresh keyframe, waits for it, and rejects late fragments
+from retired frames. Deltas that overtake a fragmented recovery keyframe stay
+bounded in the reassembly queue until that keyframe completes or expires.
 
-Missing/unsupported discovery or an unsupported browser uses WebSocket. A
-configured QUIC endpoint failing does **not** silently fall back to TCP: check
-UDP reachability, certificate validity/trust, and browser support. Cross-origin
-engines need readable discovery (CORS or same-origin proxy) for QUIC; otherwise
-they keep their existing WebSocket behavior.
+A completely missing packet has no receiver-side fragments to time out. The
+server detects its missing disposition and requests a fresh frame through the
+normal, permission-checked `SetStreams` refresh path. That path also invalidates
+capture for idle windows. Refresh requests are throttled to one per 500 ms per
+connection and refresh its currently requested windows. They do not resend an
+old frame or fragment.
+
+Local QUIC datagram buffering is bounded to 8 KiB. The sender uses Quinn's
+`send_datagram_wait` to pace into available local queue space, with a 150 ms
+per-frame send deadline. That wait is for queue capacity, not acknowledgement
+or retransmission of media. It prevents a keyframe burst from evicting its own
+fragments through the non-waiting enqueue API.
+
+These are **local send and reassembly deadlines**, not a synchronized end-to-end
+latency guarantee. Network/kernel queues and congestion control still apply.
+No forward error correction is implemented; packet loss can cause a brief pause
+while a fresh keyframe arrives. Moonlight parity and lossy-WAN performance are
+not certified by this implementation.
+
+## Budgets, compatibility and resource limits
+
+Frame/byte/audio budgets are per client. A disposition releases a packet's
+budget, whether it was read or retired; it does not certify decoding/display.
+A missing disposition expires after 300 ms, also releasing the budget. Late or
+duplicate dispositions are harmless. Neither missing media nor its telemetry
+closes an otherwise healthy control session.
+
+QUIC RTT feeds the rolling-baseline delay estimate. The existing bitrate
+controller and media backpressure remain active. Changing transport does not
+remove encoder quality, chroma subsampling or browser scaling effects.
+
+Bounds include 8 registered sessions across transports, 16 QUIC handshake/session
+tasks, 4 MiB control packets, 32 MiB media payloads, 32 simultaneous partial
+packets and 64 MiB aggregate receiver reassembly storage. Receiver window
+tracking is bounded to 128 entries; evicting an old entry requires a fresh
+independent frame if it becomes active again. A 256-entry retirement cache
+suppresses late fragments. Control writes/opening handshakes have 5-second
+deadlines; QUIC idle timeout is 15 seconds.
+
+The new shell also understands v1 engines with reliable per-window streams.
+An old shell that cannot recognize v2 discovery keeps its WebSocket compatibility
+path. Missing/unreadable discovery or unsupported WebTransport uses WebSocket.
+An advertised QUIC endpoint failing does **not** silently fall back to TCP:
+check UDP reachability, certificate validity/trust and browser support.
+Cross-origin discovery needs CORS or a same-origin proxy. Bulk file uploads
+continue using their existing reliable WebSocket channels.
 
 ## Verification and diagnostics
 
-Session → Connection → Transport shows the actual selected adapter. Browser
-console also reports `WebTransport / QUIC (UDP)` or the legacy transport. Engine
-logs identify QUIC sessions and budget changes. Do not include credential-bearing
-request URLs in diagnostic reports.
+Session → Connection → Transport shows `WebTransport (QUIC datagrams)` for v2,
+`WebTransport (QUIC streams)` for v1, or `WebSocket (TCP)` for compatibility.
+Browser console reports the adapter too. Engine logs identify QUIC connections
+and budget changes. Never include credential-bearing URLs in diagnostic reports.
 
 ```sh
-pnpm exec vitest run packages/shell/test/transport.test.ts packages/shell/test/connection.test.ts
+pnpm exec vitest run packages/shell/test/mediaDatagrams.test.ts packages/shell/test/transport.test.ts
 pnpm run typecheck
-cargo test -p lwfa-engine shell::webtransport::tests
+cargo test -p lwfa-engine shell::
 ```
 
-The Rust integration test uses real loopback QUIC with certificate pinning and
-checks control/media delivery, acknowledgement accounting, eviction and cleanup.
-Frontend tests cover fragmented/coalesced framing, size limits, independent
-media streams, acknowledgements, and explicit compatibility/failure behavior.
+Tests cover loss of fragments/whole frames, duplicate and reordered fragments,
+reference-chain recovery, deltas overtaking IDRs, audio/window independence,
+malformed metadata, memory limits and per-client fan-out sequence gaps. The
+native test uses actual pinned QUIC datagrams, fragmentation, receipt expiry,
+reliable control and eviction cleanup. Browser injection additionally exercises
+actual H.264 decode after dropping an IDR fragment and a whole predictive frame.
+
+The [WebTransport specification](https://www.w3.org/TR/webtransport/) defines
+unreliable datagrams and the `requireUnreliable` option. The application's
+fragmentation, deadlines and codec recovery above are LWFA protocol behavior.

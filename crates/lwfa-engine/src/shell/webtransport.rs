@@ -1,21 +1,20 @@
 //! Native QUIC adapter for the existing authenticated shell session registry.
 //!
-//! One reliable control stream, one audio stream and one stream per window.
-//! Predictive frames stay ordered within a window; a lost packet on that stream
-//! cannot block control, audio or another window. Media is counted until the
-//! browser reads and acknowledges it, not until QUIC buffers a write.
+//! One reliable control stream and unreliable fragmented media datagrams.
+//! Receiver deadlines and IDR refresh recover predictive video after loss.
+//! Delivery receipts bound queued media but never trigger retransmission;
+//! expired media releases its budget without closing the control session.
 use super::*;
 use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
 use std::time::Instant;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
 
 const MAX_CONTROL: usize = 4 * 1024 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
-const MAX_LANES: usize = 128;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 static DISCOVERY: OnceLock<serde_json::Value> = OnceLock::new();
 type Accounts = Option<Arc<Mutex<crate::accounts::Accounts>>>;
@@ -67,16 +66,18 @@ pub(super) fn start(
                     } else {
                         None
                     };
+                    let mut transport = wtransport::quinn::TransportConfig::default();
+                    transport.datagram_send_buffer_size(8 * 1024);
                     let config = ServerConfig::builder()
                         .with_bind_address(addr)
-                        .with_identity(identity)
+                        .with_custom_transport(identity, transport)
                         .keep_alive_interval(Some(Duration::from_secs(1)))
                         .max_idle_timeout(Some(Duration::from_secs(15)))?
                         .build();
                     let endpoint = Endpoint::server(config)?;
                     let port = endpoint.local_addr()?.port();
                     let _ = DISCOVERY.set(
-                        serde_json::json!({"port": port, "certificateHash": hash, "version": 1}),
+                        serde_json::json!({"port": port, "certificateHash": hash, "version": 2}),
                     );
                     tracing::info!("WebTransport listening on UDP {}", endpoint.local_addr()?);
                     let _ = ready_tx.send(Ok(()));
@@ -160,8 +161,49 @@ struct Pending {
     size: usize,
     audio: bool,
     since: Instant,
+    window: u64,
 }
 type Acks = Arc<Mutex<HashMap<u64, Pending>>>;
+mod datagrams;
+
+#[derive(Default)]
+struct Recovery {
+    streams: Option<ToEngine>,
+    last: Option<Instant>,
+}
+type SharedRecovery = Arc<Mutex<Recovery>>;
+fn recover(recovery: &SharedRecovery, events: &LoopSender<ShellEvent>, id: SessionId, window: u64) {
+    let Ok(mut state) = recovery.lock() else {
+        return;
+    };
+    if state
+        .last
+        .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
+    {
+        return;
+    }
+    let Some(ToEngine::SetStreams { windows, .. }) = state.streams.as_ref() else {
+        return;
+    };
+    if !windows.contains(&WindowId(window)) {
+        return;
+    }
+    if let Some(message) = state.streams.clone() {
+        state.last = Some(Instant::now());
+        // Reuse the normal permission-checked refresh path, including damage
+        // invalidation for idle windows. Request NEW IDRs, never old fragments.
+        let _ = events.send(ShellEvent::Message(id, message));
+    }
+}
+fn retire(slot: &Slot, pending: Pending) {
+    if pending.audio {
+        slot.audio_in_flight.fetch_sub(1, Ordering::Relaxed);
+    } else {
+        slot.in_flight.fetch_sub(1, Ordering::Relaxed);
+        slot.in_flight_bytes
+            .fetch_sub(pending.size, Ordering::Relaxed);
+    }
+}
 
 struct SessionGuard {
     slot: Arc<Slot>,
@@ -210,21 +252,31 @@ async fn run(
         connection.remote_address()
     );
     let acks: Acks = Arc::new(Mutex::new(HashMap::new()));
+    let recovery: SharedRecovery = Arc::new(Mutex::new(Recovery::default()));
     let mut tasks = JoinSet::new();
-    tasks.spawn(read_control(
+    let read = tokio::spawn(read_control(
         control_recv,
         slot.clone(),
         acks.clone(),
-        events,
+        events.clone(),
+        recovery.clone(),
     ));
-    let mut lanes: HashMap<u64, mpsc::Sender<(u64, tungstenite::Bytes)>> = HashMap::new();
+    // Aborted even if an error exits the dispatch loop.
+    struct ReaderGuard(tokio::task::AbortHandle);
+    impl Drop for ReaderGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _reader_guard = ReaderGuard(read.abort_handle());
+    tokio::pin!(read);
     let mut sequence = 0u64;
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delay = DelayEstimate::default();
+    let mut last_probe = Instant::now();
     let mut over_limit = 0;
     loop {
-        // Register before draining: a producer cannot race the sleep below.
         let notified = clients.quic_wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -246,67 +298,86 @@ async fn run(
                     )
                     .await??;
                 }
-                Outgoing::Frame(_) | Outgoing::Audio(_) => {
-                    let (bytes, audio) = match message {
-                        Outgoing::Frame(b) => (b, false),
-                        Outgoing::Audio(b) => (b, true),
+                Outgoing::Frame(_, _) | Outgoing::Audio(_) => {
+                    let (bytes, audio, frame) = match message {
+                        Outgoing::Frame(b, n) => (b, false, n),
+                        Outgoing::Audio(b) => (b, true, 0),
                         _ => unreachable!(),
                     };
                     if bytes.len() > MAX_MEDIA {
                         return Err(io::Error::other("media packet too large").into());
                     }
-                    // Window IDs start at one; zero is the separate audio lane.
-                    let lane = if audio {
-                        0
+                    let (window, key) = if audio {
+                        (0, true)
                     } else {
-                        lwfa_proto::FrameHeader::decode(&bytes)
+                        let header = lwfa_proto::FrameHeader::decode(&bytes)
                             .ok_or_else(|| io::Error::other("invalid encoded frame"))?
-                            .0
-                            .window
-                            .0
+                            .0;
+                        (
+                            header.window.0,
+                            header.keyframe || header.format == lwfa_proto::FrameFormat::Jpeg,
+                        )
                     };
-                    if let std::collections::hash_map::Entry::Vacant(entry) = lanes.entry(lane) {
-                        if tasks.len() > MAX_LANES {
-                            return Err(io::Error::other("too many media lanes").into());
-                        }
-                        let (tx, rx) = mpsc::channel(4);
-                        entry.insert(tx);
-                        tasks.spawn(media_lane(connection.clone(), rx, audio));
-                    }
                     sequence = sequence
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("sequence exhausted"))?;
                     acks.lock()
-                        .map_err(|_| io::Error::other("ack lock"))?
+                        .map_err(|_| io::Error::other("receipt lock"))?
                         .insert(
                             sequence,
                             Pending {
                                 size: bytes.len(),
                                 audio,
                                 since: Instant::now(),
+                                window,
                             },
                         );
-                    lanes[&lane]
-                        .try_send((sequence, bytes))
-                        .map_err(|_| io::Error::other("media queue overflow"))?;
+                    let connection = connection.clone();
+                    let media = datagrams::Media {
+                        packet: sequence,
+                        lane: window,
+                        frame: if audio { sequence } else { frame },
+                        audio,
+                        key,
+                        bytes,
+                        deadline: Instant::now() + datagrams::LIFETIME,
+                    };
+                    tasks.spawn(
+                        async move { (media.packet, datagrams::send(connection, media).await) },
+                    );
                 }
             }
         }
         tokio::select! {
             _ = &mut notified => {},
             _ = connection.closed() => return Ok(()),
-            result = tasks.join_next() => {
-                if let Some(result) = result { result??; }
-                return Err(io::Error::other("transport stream closed").into())
+            result = &mut read => { result??; return Ok(()) },
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                let (packet, sent) = result.ok_or_else(|| io::Error::other("media task missing"))??;
+                if sent.is_err() {
+                    // Congestion/deadline expiry drops media, never the session.
+                    if let Some(pending) = acks.lock().map_err(|_| io::Error::other("receipt lock"))?.remove(&packet) {
+                        if !pending.audio { recover(&recovery, &events, id, pending.window); }
+                        retire(&slot, pending);
+                    }
+                }
             },
             _ = tick.tick() => {
-                let queue = delay.observe(connection.rtt(), Instant::now());
-                slot.rtt_excess.store(queue.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
-                over_limit = if queue >= crate::bitrate::QUEUE_DELAY_LIMIT { over_limit + 1 } else { 0 };
-                slot.delay_congested.store(over_limit >= SUSTAINED_PROBES, Ordering::Relaxed);
-                slot.answering.store(true, Ordering::Relaxed);
-                if acks.lock().map_err(|_| io::Error::other("ack lock"))?.values().any(|p| p.since.elapsed() > WRITE_TIMEOUT) {
-                    return Err(io::Error::other("browser stopped acknowledging media").into())
+                if last_probe.elapsed() >= PROBE_INTERVAL {
+                    last_probe = Instant::now();
+                    let queue = delay.observe(connection.rtt(), Instant::now());
+                    slot.rtt_excess.store(queue.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                    over_limit = if queue >= crate::bitrate::QUEUE_DELAY_LIMIT { over_limit + 1 } else { 0 };
+                    slot.delay_congested.store(over_limit >= SUSTAINED_PROBES, Ordering::Relaxed);
+                    slot.answering.store(true, Ordering::Relaxed);
+                }
+                let mut pending = acks.lock().map_err(|_| io::Error::other("receipt lock"))?;
+                let expired: Vec<_> = pending.iter().filter(|(_, p)| p.since.elapsed() >= datagrams::RECEIPT_TIMEOUT).map(|(&n, _)| n).collect();
+                for n in expired {
+                    if let Some(p) = pending.remove(&n) {
+                        if !p.audio { recover(&recovery, &events, id, p.window); }
+                        retire(&slot, p);
+                    }
                 }
             },
             _ = connection.accept_bi() => return Err(io::Error::other("extra control stream").into()),
@@ -315,35 +386,12 @@ async fn run(
     }
 }
 
-async fn media_lane(
-    connection: Connection,
-    mut packets: mpsc::Receiver<(u64, tungstenite::Bytes)>,
-    audio: bool,
-) -> Result<(), Failure> {
-    let mut stream = tokio::time::timeout(WRITE_TIMEOUT, async {
-        Ok::<_, Failure>(connection.open_uni().await?.await?)
-    })
-    .await??;
-    stream.set_priority(if audio { 50 } else { 0 });
-    stream.write_all(&[if audio { 2 } else { 1 }]).await?;
-    while let Some((sequence, bytes)) = packets.recv().await {
-        tokio::time::timeout(WRITE_TIMEOUT, async {
-            stream
-                .write_all(&((bytes.len() + 8) as u32).to_be_bytes())
-                .await?;
-            stream.write_all(&sequence.to_be_bytes()).await?;
-            stream.write_all(&bytes).await
-        })
-        .await??;
-    }
-    Ok(())
-}
-
 async fn read_control(
     mut stream: RecvStream,
     slot: Arc<Slot>,
     acks: Acks,
     events: LoopSender<ShellEvent>,
+    recovery: SharedRecovery,
 ) -> Result<(), Failure> {
     loop {
         let packet = read_packet(&mut stream, MAX_CONTROL).await?;
@@ -352,29 +400,35 @@ async fn read_control(
         };
         match kind {
             0 => {
-                events.send(ShellEvent::Message(
-                    slot.id,
-                    serde_json::from_slice::<ToEngine>(body)?,
-                ))?;
+                let message: ToEngine = serde_json::from_slice(body)?;
+                if matches!(&message, ToEngine::SetStreams { .. }) {
+                    recovery
+                        .lock()
+                        .map_err(|_| io::Error::other("recovery lock"))?
+                        .streams = Some(message.clone());
+                }
+                events.send(ShellEvent::Message(slot.id, message))?;
             }
             1 if body.len() == 8 => {
                 let sequence = u64::from_be_bytes(body.try_into()?);
+                // Receipts for already expired or discarded media are harmless.
                 let pending = acks
                     .lock()
-                    .map_err(|_| io::Error::other("ack lock"))?
+                    .map_err(|_| io::Error::other("receipt lock"))?
                     .remove(&sequence);
-                let Some(pending) = pending else {
-                    return Err(io::Error::other("unknown media acknowledgement").into());
-                };
-                if pending.audio {
-                    slot.audio_in_flight.fetch_sub(1, Ordering::Relaxed);
-                } else {
-                    slot.in_flight.fetch_sub(1, Ordering::Relaxed);
-                    slot.in_flight_bytes
-                        .fetch_sub(pending.size, Ordering::Relaxed);
+                if let Some(pending) = pending {
+                    retire(&slot, pending);
                 }
             }
-            2 if body == [1] => {}
+            2 if body == [2] => {}
+            3 if body.len() == 8 => {
+                recover(
+                    &recovery,
+                    &events,
+                    slot.id,
+                    u64::from_be_bytes(body.try_into()?),
+                );
+            }
             _ => return Err(io::Error::other("invalid control packet").into()),
         }
     }
@@ -407,8 +461,29 @@ async fn read_packet(stream: &mut RecvStream, max: usize) -> Result<Vec<u8>, Fai
 mod tests {
     use super::*;
 
+    async fn receive_media(connection: &Connection) -> (u64, Vec<u8>) {
+        let first = connection.receive_datagram().await.unwrap();
+        assert_eq!(&first[..4], b"LWFD");
+        let packet = u64::from_be_bytes(first[8..16].try_into().unwrap());
+        let size = u32::from_be_bytes(first[32..36].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes(first[38..40].try_into().unwrap()) as usize;
+        let stride = u16::from_be_bytes(first[40..42].try_into().unwrap()) as usize;
+        let mut bytes = vec![0; size];
+        let mut parts = vec![first];
+        for _ in 1..count {
+            parts.push(connection.receive_datagram().await.unwrap());
+        }
+        for part in parts {
+            assert_eq!(u64::from_be_bytes(part[8..16].try_into().unwrap()), packet);
+            let offset = u16::from_be_bytes(part[36..38].try_into().unwrap()) as usize * stride;
+            bytes[offset..offset + part.len() - datagrams::HEADER]
+                .copy_from_slice(&part[datagrams::HEADER..]);
+        }
+        (packet, bytes)
+    }
+
     #[tokio::test]
-    async fn quic_session_delivers_control_and_media_and_releases_budget_only_on_ack() {
+    async fn quic_datagrams_fragment_media_and_expire_lost_receipts_without_stalling_control() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let identity = Identity::self_signed(["localhost"]).unwrap();
             let hash = identity.certificate_chain().as_slice()[0].hash();
@@ -453,7 +528,7 @@ mod tests {
                 .await
                 .unwrap();
             let (mut send, mut recv) = connection.open_bi().await.unwrap().await.unwrap();
-            write_packet(&mut send, &[2, 1], MAX_CONTROL).await.unwrap();
+            write_packet(&mut send, &[2, 2], MAX_CONTROL).await.unwrap();
             while clients.with(1, |_| ()).is_none() {
                 tokio::task::yield_now().await;
             }
@@ -473,17 +548,13 @@ mod tests {
                 format: lwfa_proto::FrameFormat::Jpeg,
                 keyframe: true,
             }
-            .encode_with_payload(&[1, 2, 3]);
+            .encode_with_payload(&vec![3; 5000]);
             FrameSink {
                 clients: clients.clone(),
             }
             .send_frame(WindowId(1), bytes.clone());
-            let mut media = connection.accept_uni().await.unwrap();
-            let mut kind = [0];
-            media.read_exact(&mut kind).await.unwrap();
-            assert_eq!(kind, [1]);
-            let data = read_packet(&mut media, MAX_MEDIA).await.unwrap();
-            assert_eq!(&data[8..], bytes);
+            let (packet, media) = receive_media(&connection).await;
+            assert_eq!(media, bytes);
             assert_eq!(
                 clients.with(1, |s| s.in_flight.load(Ordering::Relaxed)),
                 Some(1)
@@ -497,11 +568,8 @@ mod tests {
                 opus: Some(vec![9, 8, 7]),
                 pcm: None,
             });
-            let mut audio = connection.accept_uni().await.unwrap();
-            audio.read_exact(&mut kind).await.unwrap();
-            assert_eq!(kind, [2]);
-            let sound = read_packet(&mut audio, MAX_MEDIA).await.unwrap();
-            assert_eq!(&sound[8..], &[9, 8, 7]);
+            let (sound_packet, sound) = receive_media(&connection).await;
+            assert_eq!(&sound, &[9, 8, 7]);
             clients.send_to(1, ToShell::Pong);
             assert_eq!(
                 serde_json::from_slice::<ToShell>(
@@ -510,9 +578,13 @@ mod tests {
                 .unwrap(),
                 ToShell::Pong
             );
-            write_packet(&mut send, &[&[1][..], &sound[..8]].concat(), MAX_CONTROL)
-                .await
-                .unwrap();
+            write_packet(
+                &mut send,
+                &[&[1][..], &sound_packet.to_be_bytes()].concat(),
+                MAX_CONTROL,
+            )
+            .await
+            .unwrap();
             while clients.with(1, |s| s.audio_in_flight.load(Ordering::Relaxed)) != Some(0) {
                 tokio::task::yield_now().await;
             }
@@ -520,11 +592,43 @@ mod tests {
                 clients.with(1, |s| s.in_flight.load(Ordering::Relaxed)),
                 Some(1)
             );
-            let ack = [&[1][..], &data[..8]].concat();
-            write_packet(&mut send, &ack, MAX_CONTROL).await.unwrap();
+            // Deliberately lose the entire video receipt. Its finite budget
+            // expires without retransmitting media or disconnecting control.
             while clients.with(1, |s| s.in_flight.load(Ordering::Relaxed)) != Some(0) {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            // A late receipt is harmless rather than closing the session.
+            write_packet(
+                &mut send,
+                &[&[1][..], &packet.to_be_bytes()].concat(),
+                MAX_CONTROL,
+            )
+            .await
+            .unwrap();
+            clients.send_to(1, ToShell::Pong);
+            assert_eq!(
+                serde_json::from_slice::<ToShell>(
+                    &read_packet(&mut recv, MAX_CONTROL).await.unwrap()
+                )
+                .unwrap(),
+                ToShell::Pong
+            );
+            let expired = datagrams::Media {
+                packet: 99,
+                lane: 0,
+                frame: 99,
+                audio: true,
+                key: true,
+                bytes: vec![1, 2, 3].into(),
+                deadline: Instant::now() - Duration::from_millis(1),
+            };
+            assert!(
+                datagrams::send(connection.clone(), expired)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expired before enqueue")
+            );
             clients.evict(1, false);
             let reason = connection.closed().await;
             assert!(format!("{reason}").contains(REPLACED_REASON));
