@@ -1,3 +1,4 @@
+import { randomId } from "./lib/randomId";
 import { HDR_CHANGED } from "@/lib/hdr";
 /**
  * The shell.
@@ -219,14 +220,14 @@ function clientId(): string {
   try {
     const saved = localStorage.getItem(key)
     if (saved) return saved
-    const fresh = crypto.randomUUID()
+    const fresh = randomId()
     localStorage.setItem(key, fresh)
     return fresh
   } catch {
     // Private browsing, or storage disabled. A per-load id is still better
     // than none: it at least collapses the double connection React makes on
     // mount, which is the noisiest case.
-    return crypto.randomUUID()
+    return randomId()
   }
 }
 

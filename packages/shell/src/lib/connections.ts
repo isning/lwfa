@@ -1,3 +1,4 @@
+import { randomId } from "./randomId";
 /**
  * Machines this device knows how to reach.
  *
@@ -70,7 +71,7 @@ function write(next: Connection[]): void {
 }
 
 export function saveConnection(entry: Omit<Connection, "id" | "lastUsed"> & { id?: string }): void {
-  const id = entry.id ?? crypto.randomUUID()
+  const id = entry.id ?? randomId()
   const rest = current.filter((c) => c.id !== id)
   write([...rest, { ...entry, id, lastUsed: Date.now() }])
 }
