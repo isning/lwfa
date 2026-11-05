@@ -1218,6 +1218,86 @@ impl ImportDma for GlesRenderer {
 impl ImportDmaWl for GlesRenderer {}
 
 impl GlesRenderer {
+    /// Allocate normalized RGBA16 storage for compute-style packing. This GL
+    /// format has no DRM fourcc and is never advertised as a client format.
+    pub fn create_buffer_unorm16(&mut self, size: Size<i32, BufferCoord>) -> Result<GlesTexture, GlesError> {
+        if !self.extensions.iter().any(|e| e == "GL_EXT_texture_norm16") || size.w <= 0 || size.h <= 0 {
+            return Err(GlesError::UnsupportedPixelLayout);
+        }
+        unsafe {
+            self.egl.make_current()?;
+            self.gl.GetError();
+            let mut texture = 0;
+            self.gl.GenTextures(1, &mut texture);
+            self.gl.BindTexture(ffi::TEXTURE_2D, texture);
+            self.gl.TexImage2D(ffi::TEXTURE_2D, 0, 0x805B, size.w, size.h, 0, ffi::RGBA, ffi::UNSIGNED_SHORT, ptr::null());
+            if self.gl.GetError() != ffi::NO_ERROR {
+                self.gl.DeleteTextures(1, &texture);
+                return Err(GlesError::UnsupportedPixelLayout);
+            }
+            Ok(GlesTexture::from_raw(self, Some(0x805B), false, texture, size))
+        }
+    }
+
+    /// Read normalized RGBA16 storage without assigning a fictitious DRM format.
+    pub fn copy_framebuffer_unorm16(&mut self, target: &GlesTarget<'_>, region: Rectangle<i32, BufferCoord>) -> Result<GlesMapping, GlesError> {
+        self.read_framebuffer_layout(target, region, ffi::RGBA, ffi::UNSIGNED_SHORT)
+    }
+
+    fn read_framebuffer_layout(&mut self, target: &GlesTarget<'_>, region: Rectangle<i32, BufferCoord>, format: ffi::types::GLenum, layout: ffi::types::GLenum) -> Result<GlesMapping, GlesError> {
+        target.0.make_current(&self.gl, &self.egl)?;
+
+        let (_, has_alpha) = target.0.format().ok_or(GlesError::UnknownPixelFormat)?;
+
+        let bpp = gl_bpp(format, layout).ok_or(GlesError::UnsupportedPixelLayout)? / 8;
+        let size = usize::try_from(region.size.w).ok().filter(|w| *w > 0)
+            .and_then(|w| usize::try_from(region.size.h).ok().filter(|h| *h > 0).and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(bpp)).and_then(|bytes| isize::try_from(bytes).ok())
+            .ok_or(GlesError::UnsupportedPixelLayout)?;
+        let mut pbo = 0;
+        let err = unsafe {
+            self.gl.GetError(); // clear errors
+            self.gl.GenBuffers(1, &mut pbo);
+            self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
+            self.gl
+                .BufferData(ffi::PIXEL_PACK_BUFFER, size, ptr::null(), ffi::STREAM_READ);
+            self.gl
+                .ReadBuffer(if matches!(target.0, GlesTargetInternal::Surface { .. }) {
+                    ffi::BACK
+                } else {
+                    ffi::COLOR_ATTACHMENT0
+                });
+            self.gl.ReadPixels(
+                region.loc.x,
+                region.loc.y,
+                region.size.w,
+                region.size.h,
+                format,
+                layout,
+                ptr::null_mut(),
+            );
+            self.gl.ReadBuffer(ffi::NONE);
+            self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+            self.gl.GetError()
+        };
+
+        match err {
+            ffi::NO_ERROR => Ok(GlesMapping {
+                pbo,
+                format,
+                layout,
+                has_alpha,
+                size: region.size,
+                mapping: AtomicPtr::new(ptr::null_mut()),
+                destruction_callback_sender: self.destruction_callback_sender.clone(),
+            }),
+            _ => {
+                unsafe { self.gl.DeleteBuffers(1, &pbo); }
+                Err(GlesError::UnknownPixelFormat)
+            }
+        }
+    }
+
     #[profiling::function]
     fn existing_dmabuf_texture(&self, buffer: &Dmabuf) -> Result<Option<GlesTexture>, GlesError> {
         let Some(texture) = self.dmabuf_cache.get(&buffer.weak()) else {
@@ -1276,53 +1356,8 @@ impl ExportMem for GlesRenderer {
         region: Rectangle<i32, BufferCoord>,
         fourcc: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
-        target.0.make_current(&self.gl, &self.egl)?;
-
-        let (_, has_alpha) = target.0.format().ok_or(GlesError::UnknownPixelFormat)?;
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
-
-        let mut pbo = 0;
-        let err = unsafe {
-            self.gl.GetError(); // clear errors
-            self.gl.GenBuffers(1, &mut pbo);
-            self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
-            let bpp = gl_bpp(format, layout).ok_or(GlesError::UnsupportedPixelLayout)? / 8;
-            let size = (region.size.w * region.size.h * bpp as i32) as isize;
-            self.gl
-                .BufferData(ffi::PIXEL_PACK_BUFFER, size, ptr::null(), ffi::STREAM_READ);
-            self.gl
-                .ReadBuffer(if matches!(target.0, GlesTargetInternal::Surface { .. }) {
-                    ffi::BACK
-                } else {
-                    ffi::COLOR_ATTACHMENT0
-                });
-            self.gl.ReadPixels(
-                region.loc.x,
-                region.loc.y,
-                region.size.w,
-                region.size.h,
-                format,
-                layout,
-                ptr::null_mut(),
-            );
-            self.gl.ReadBuffer(ffi::NONE);
-            self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
-            self.gl.GetError()
-        };
-
-        match err {
-            ffi::NO_ERROR => Ok(GlesMapping {
-                pbo,
-                format,
-                layout,
-                has_alpha,
-                size: region.size,
-                mapping: AtomicPtr::new(ptr::null_mut()),
-                destruction_callback_sender: self.destruction_callback_sender.clone(),
-            }),
-            ffi::INVALID_ENUM | ffi::INVALID_OPERATION => Err(GlesError::UnsupportedPixelFormat(fourcc)),
-            _ => Err(GlesError::UnknownPixelFormat),
-        }
+        self.read_framebuffer_layout(target, region, format, layout)
     }
 
     fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, GlesError> {
@@ -1396,7 +1431,9 @@ impl ExportMem for GlesRenderer {
         }
 
         let size = texture_mapping.size();
-        let len = size.w * size.h * 4;
+        let bpp = gl_bpp(texture_mapping.format, texture_mapping.layout).ok_or(GlesError::UnknownPixelFormat)? / 8;
+        let len = usize::try_from(size.w).ok().and_then(|w| usize::try_from(size.h).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(bpp)).ok_or(GlesError::UnsupportedPixelLayout)?;
 
         let mapping_ptr = texture_mapping.mapping.load(Ordering::SeqCst);
         let ptr = if mapping_ptr.is_null() {

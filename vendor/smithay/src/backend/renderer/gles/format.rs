@@ -56,6 +56,7 @@ pub const fn gl_read_for_internal(format: GLenum) -> Option<(GLenum, GLenum)> {
         ffi::BGRA_EXT => Some((ffi::BGRA_EXT, ffi::UNSIGNED_BYTE)),
         ffi::RGB8 => Some((ffi::RGB, ffi::UNSIGNED_BYTE)),
         ffi::RGB10_A2 => Some((ffi::RGBA, ffi::UNSIGNED_INT_2_10_10_10_REV)),
+        0x805B => Some((ffi::RGBA, ffi::UNSIGNED_SHORT)),
         ffi::RGBA16F => Some((ffi::RGBA, ffi::HALF_FLOAT)),
         _ => None,
     }
@@ -68,7 +69,7 @@ pub const fn gl_bpp(format: GLenum, type_: GLenum) -> Option<usize> {
         (ffi::RGBA, ffi::UNSIGNED_BYTE)
         | (ffi::BGRA_EXT, ffi::UNSIGNED_BYTE)
         | (ffi::RGBA, ffi::UNSIGNED_INT_2_10_10_10_REV) => Some(32),
-        (ffi::RGBA, ffi::HALF_FLOAT) => Some(64),
+        (ffi::RGBA, ffi::HALF_FLOAT) | (ffi::RGBA, ffi::UNSIGNED_SHORT) => Some(64),
         _ => None,
     }
 }
