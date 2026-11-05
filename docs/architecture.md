@@ -834,3 +834,27 @@ and without that the shell would ask again on every reload forever.
 
 See [color management and HDR](color-management.md) for named source spaces,
 Main10/PQ streaming, viewer requirements and color-specific verification.
+
+### Native Wayland HiDPI rendering
+
+The primary browser reports its logical viewport and device pixel ratio. Layout
+and input coordinates stay in logical pixels; the virtual output mode, native
+Wayland surface preferences, capture targets and encoded frames use physical
+pixels. A 1000×800 viewport at density 2 therefore produces 2000×1600 frames
+without changing window placement or pointer coordinates. Resolution media-query
+changes refresh the report even when the CSS viewport does not resize.
+
+Density is shared by the session and controlled by its primary connection. Hello
+and layout updates report the effective output density to followers and reconnecting
+clients. New surfaces, subsurfaces and popups receive buffer-scale preferences;
+clients supporting fractional scaling can render at the requested density.
+XWayland retains its existing density-1 capture policy.
+
+Requested density is bounded to 1–3 and by the existing capture pixel and edge
+budgets. H.264 additionally limits each capture edge to 4096 pixels; other codecs
+retain the general capture limits. Surface preferences follow these per-window
+codec limits, so oversized windows may render below the output density. Native
+applications decide whether to honor scale preferences. Session diagnostics show
+logical viewport size, output density and the largest received frame separately.
+Density 2 requires approximately four times the capture pixels of density 1;
+this implementation does not automatically trade density against network bandwidth.

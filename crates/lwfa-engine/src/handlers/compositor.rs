@@ -32,6 +32,7 @@ impl CompositorHandler for Lwfa {
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
+        self.init_surface_density(surface);
         use smithay::wayland::{compositor::{add_pre_commit_hook, add_blocker, with_states}, drm_syncobj::DrmSyncobjCachedState};
         add_pre_commit_hook::<Self, _>(surface, |state, dh, surface| {
             let point = with_states(surface, |states| states.cached_state.get::<DrmSyncobjCachedState>().pending().acquire_point.clone());

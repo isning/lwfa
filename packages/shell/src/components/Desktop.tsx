@@ -23,6 +23,7 @@
  * answered, and for a shell that is not allowed to resize it.
  */
 
+import { devicePixelRatio, watchPixelRatio } from "@/lib/pixelRatio"
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { WindowId, WindowInfo } from "@lwfa/proto"
 import type { WindowLayout } from "@lwfa/proto"
@@ -93,7 +94,7 @@ export const Desktop = memo(function Desktop({
         onViewport(
           Math.round(rect.width),
           Math.round(rect.height),
-          globalThis.devicePixelRatio || 1,
+          devicePixelRatio(),
         )
       }, 150)
     }
@@ -101,7 +102,9 @@ export const Desktop = memo(function Desktop({
 
     const observer = new ResizeObserver(report)
     observer.observe(box)
+    const stopPixelRatio = watchPixelRatio(report)
     return () => {
+      stopPixelRatio()
       observer.disconnect()
       clearTimeout(timer)
     }

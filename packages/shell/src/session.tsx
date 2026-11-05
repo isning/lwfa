@@ -31,6 +31,8 @@ export interface SessionState {
   status: Status
   statusDetail?: string | undefined
   output: Output
+  /** Effective physical pixels per logical pixel, reported by the engine. */
+  renderDensity: number
   windows: Map<WindowId, WindowInfo>
   strip: StripState
   /** The endpoint this shell is talking to, for display. */

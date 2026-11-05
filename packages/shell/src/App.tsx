@@ -279,6 +279,7 @@ export function App(): React.ReactElement {
   const [status, setStatus] = useState<Status>("connecting");
   const [statusDetail, setStatusDetail] = useState<string>();
   const [output, setOutput] = useState<Output>({ width: 0, height: 0 });
+  const [renderDensity, setRenderDensity] = useState(1);
   const [windows, setWindows] = useState<Map<WindowId, WindowInfo>>(new Map());
   /**
    * Windows the engine has said have drawn nothing at all.
@@ -629,6 +630,7 @@ export function App(): React.ReactElement {
           };
           outputRef.current = out;
           setOutput(out);
+          setRenderDensity(message.output.scale);
           const liveIds = new Set(message.windows.map((w) => w.id));
           for (const id of knownWindows) {
             if (liveIds.has(id)) continue;
@@ -721,6 +723,7 @@ export function App(): React.ReactElement {
           };
           outputRef.current = out;
           setOutput(out);
+          setRenderDensity(message.output.scale);
           if (pendingHello) break;
           // Whether this is the answer we were waiting for or an ordinary
           // resize, the response is the same: lay out for the shape we now
@@ -760,6 +763,7 @@ export function App(): React.ReactElement {
           };
           outputRef.current = out;
           setOutput(out);
+          setRenderDensity(message.output.scale);
           setFollowed(message.windows);
           break;
         }
@@ -1369,6 +1373,7 @@ export function App(): React.ReactElement {
       status,
       statusDetail,
       output,
+      renderDensity,
       windows,
       strip,
       endpoint: ENGINE_BASE,
@@ -1379,7 +1384,7 @@ export function App(): React.ReactElement {
       peers,
       engineVersion,
     }),
-    [status, statusDetail, output, windows, strip, primary, peers, sessionId, engineVersion],
+    [status, statusDetail, output, renderDensity, windows, strip, primary, peers, sessionId, engineVersion],
   );
 
   if (!password) {

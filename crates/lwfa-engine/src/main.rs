@@ -732,6 +732,9 @@ fn sync_stream_codec(state: &mut Lwfa, previous: Option<lwfa_proto::Codec>) {
         worker.set_codec(codec);
     }
     if codec != previous {
+        for id in state.layout.all_ids() {
+            state.apply_window_density(id);
+        }
         // Idle windows also need a self-contained frame in the new format.
         state.capture.invalidate_all();
         if let Some(worker) = state.encoders.as_ref() {
@@ -2022,6 +2025,27 @@ mod tests {
     }
 
     #[test]
+    fn only_the_primary_can_change_density_and_reconnects_keep_the_effective_scale() {
+        let mut state = negotiation_state();
+        state.config.session.xwayland = false;
+        state.primary = Some(1);
+        state.sessions.get_mut(&2).unwrap().permissions.mode = SessionMode::Interact;
+        let output = output::init(&mut state, "hidpi", "headless", (800, 600).into(), smithay::utils::Transform::Normal);
+        handle_shell_event(&mut state, ShellEvent::Message(1, ToEngine::SetViewport { width: 800, height: 600, scale: 2.0 }));
+        assert_eq!(output.current_mode().unwrap().size, (1600, 1200).into());
+        handle_shell_event(&mut state, ShellEvent::Message(2, ToEngine::SetViewport { width: 1000, height: 800, scale: 1.0 }));
+        assert_eq!(state.layout.output_size(), (800, 600).into());
+        assert_eq!(state.render_density(), 2.0);
+        if let ToShell::Hello { output, .. } = state.hello(2) {
+            assert_eq!(output.scale, 2.0);
+        } else { panic!("expected hello"); }
+        handle_shell_event(&mut state, ShellEvent::Message(1, ToEngine::SetViewport { width: 800, height: 600, scale: 1.25 }));
+        assert_eq!(state.render_density(), 1.25);
+        assert_eq!(state.layout.output_size(), (800, 600).into());
+        assert_eq!(output.current_mode().unwrap().size, (1000, 750).into());
+    }
+
+    #[test]
     fn early_browser_launch_waits_for_a_valid_primary_viewport() {
         let mut state = negotiation_state();
         state.config.session.xwayland = true;
@@ -2184,3 +2208,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod hidpi_tests;

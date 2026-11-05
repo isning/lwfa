@@ -1440,6 +1440,11 @@ impl EncodeWorker {
         if let Ok(mut admission) = self.admission.lock() { admission.codec_changed(codec); }
         self.work.control(Control::Codec(codec));
     }
+    /// The active codec also constrains physical capture dimensions.
+    pub(crate) fn negotiated_codec(&self) -> Option<lwfa_proto::Codec> {
+        self.admission.lock().unwrap().codec
+    }
+
 }
 
 impl Drop for EncodeWorker {
@@ -1455,9 +1460,6 @@ impl EncodeWorker {
         }
     }
 
-    pub(crate) fn negotiated_codec(&self) -> Option<lwfa_proto::Codec> {
-        self.admission.lock().unwrap().codec
-    }
 }
 
 #[cfg(test)]

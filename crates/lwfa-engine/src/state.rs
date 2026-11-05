@@ -384,7 +384,7 @@ impl Lwfa {
         let dh = display.handle();
         let config = crate::config::Config::load();
 
-        let compositor_state = CompositorState::new::<Self>(&dh);
+        let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         // Advertised unconditionally, and only Xwayland can bind it. Creating
         // the global costs nothing if Xwayland never starts.
@@ -1110,7 +1110,7 @@ impl Lwfa {
             output: lwfa_proto::Output {
                 width: size.w,
                 height: size.h,
-                scale: 1.0,
+                scale: self.render_density(),
             },
         };
         for id in self.sessions.keys() {
@@ -1130,7 +1130,7 @@ impl Lwfa {
                 output: lwfa_proto::Output {
                     width: size.w,
                     height: size.h,
-                    scale: 1.0,
+                    scale: self.render_density(),
                 },
             },
         );
@@ -1163,7 +1163,7 @@ impl Lwfa {
             output: lwfa_proto::Output {
                 width: size.w,
                 height: size.h,
-                scale: 1.0,
+                scale: self.render_density(),
             },
             windows,
             focused: self.focused,

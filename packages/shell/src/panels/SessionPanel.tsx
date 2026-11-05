@@ -45,7 +45,7 @@ import { useFocusReturn } from "@/lib/useFocusReturn"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 
 function SessionPanel() {
-  const { status, statusDetail, output, windows, strip, endpoint, account, permissions, primary, peers, engineVersion } =
+  const { status, statusDetail, output, renderDensity, windows, strip, endpoint, account, permissions, primary, peers, engineVersion } =
     useSessionState()
   const actions = useSessionActions()
   const entries = useLog()
@@ -86,7 +86,8 @@ function SessionPanel() {
             {status === "connected" && <Row label="Transport" value={statusDetail ?? "WebSocket (TCP)"} />}
             <Row label="Decode" value={describeFormat(format)} />
             <Row label="Windows" value={windows.size} />
-            <Row label="Viewport" value={output.width > 0 ? `${output.width} × ${output.height}` : "Unavailable"} />
+            <Row label="Viewport" value={output.width > 0 ? `${output.width} × ${output.height} logical px` : "Unavailable"} />
+            <Row label="Render density" value={output.width > 0 ? `${Number(renderDensity.toFixed(2))}×` : "Unavailable"} />
           </dl>
         </PanelGroup>
         {report.tone === "good" ? null : (

@@ -686,7 +686,7 @@ fn configured_client_rect(
 /// ordinary client. Capture also bounds apps that refuse the requested size.
 fn bounded_client_rect(mut rect: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
     if !crate::surface_density::valid_capture_size(rect.size.to_physical(1)) {
-        let density = crate::surface_density::bounded_density(rect.size);
+        let density = crate::surface_density::bounded_density(rect.size, 1.0);
         rect.size = (
             (f64::from(rect.size.w) * density).round().clamp(1.0, 8192.0) as i32,
             (f64::from(rect.size.h) * density).round().clamp(1.0, 8192.0) as i32,

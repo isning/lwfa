@@ -46,6 +46,7 @@ impl XdgShellHandler for Lwfa {
         // something places it, so it cannot flash at the origin for a frame
         // while the shell is deciding.
         self.space.map_element(window, (0, 0), false);
+        self.apply_window_density(id);
 
         match self.layout.mode() {
             Mode::Shell => {
