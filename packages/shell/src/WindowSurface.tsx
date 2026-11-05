@@ -1,5 +1,6 @@
+import { choosePresentation, notePresentation, forgetPresentation } from "@/lib/presentation"
 import { drawHdr, disableHdr } from "@/lib/hdr"
-import { NativeHdrPresenter, needsNativeHdr } from "@/lib/native-hdr"
+import { NativeHdrPresenter, nativeVideoAvailable } from "@/lib/native-hdr"
 /**
  * One live window, composited in the DOM.
  *
@@ -19,14 +20,14 @@ import { NativeHdrPresenter, needsNativeHdr } from "@/lib/native-hdr"
  */
 
 import { tap } from "@/lib/haptics"
-import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react"
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import type { Rect, WindowId } from "@lwfa/proto"
 import { edgeLeave, edgePark, evdevFromButton, wheelDelta, WheelClassifier, windowPoint } from "./input.js"
 import { describe, measure, probeEnabled } from "@/lib/captureProbe"
 import { LongPress } from "@/lib/longPress"
 import { useDock } from "@/lib/dock"
 import { beginDrag, endDrag, getMouseMode } from "@/lib/mouse"
-import { getPrefs } from "@/lib/prefs"
+import { getPrefs, usePrefs } from "@/lib/prefs"
 import { useFrame } from "@/lib/frames"
 import { log } from "@/lib/log"
 import { motion } from "@/lib/motion"
@@ -165,15 +166,30 @@ export const WindowSurface = memo(function WindowSurface({
   // Subscribed per window, so a frame for another window does not re-render
   // this one. See lib/frames.ts.
   const frame = useFrame(id)
-  const nativeHdr = !!frame && "hdr" in frame && needsNativeHdr(frame.video)
+  const { stream: { presentation: preference } } = usePrefs()
+  const [nativeFailed, setNativeFailed] = useState(false)
+  useEffect(() => { setNativeFailed(false) }, [preference])
+  const presentation = frame ? choosePresentation(preference, frame, nativeVideoAvailable() && !nativeFailed) : null
+  const nativePresentation = presentation?.path === "Native video"
+  useEffect(() => {
+    if (presentation) notePresentation(id, presentation)
+  }, [id, presentation?.path, presentation?.reason])
+  useEffect(() => () => forgetPresentation(id), [id])
+  const presentationFailed = (reason: string) => {
+    log("warn", `[presentation] ${reason}; using Canvas`)
+    setNativeFailed(true)
+    if (frame && "hdr" in frame) disableHdr(reason)
+  }
+  const failureHandler = useRef(presentationFailed)
+  failureHandler.current = presentationFailed
   const nativeVideo = useRef<HTMLVideoElement>(null)
   const nativePresenter = useRef<NativeHdrPresenter | null>(null)
   useEffect(() => {
-    if (!nativeHdr || !nativeVideo.current) return
-    try { nativePresenter.current = new NativeHdrPresenter(nativeVideo.current, disableHdr) }
-    catch (error) { disableHdr(String(error)) }
+    if (!nativePresentation || !nativeVideo.current) return
+    try { nativePresenter.current = new NativeHdrPresenter(nativeVideo.current, reason => failureHandler.current(reason)) }
+    catch (error) { presentationFailed(String(error)) }
     return () => { nativePresenter.current?.destroy(); nativePresenter.current = null }
-  }, [nativeHdr])
+  }, [nativePresentation])
   const send = useCallback((event: SurfaceInput) => {
     if (event.kind === "motion" || event.kind === "touchDown" || event.kind === "touchMotion") {
       const size = contentSize()
@@ -250,9 +266,9 @@ export const WindowSurface = memo(function WindowSurface({
 
   useEffect(() => {
     if (!frame || frame.width === 0 || frame.height === 0) return
-    if (nativeHdr && "hdr" in frame) {
-      try { void nativePresenter.current?.draw(frame.video).catch(error => disableHdr(String(error))) }
-      catch (error) { disableHdr(String(error)) }
+    if (nativePresentation && "video" in frame) {
+      try { void nativePresenter.current?.draw(frame.video).catch(error => presentationFailed(String(error))) }
+      catch (error) { presentationFailed(String(error)) }
       return
     }
     const el = canvas.current
@@ -298,7 +314,7 @@ export const WindowSurface = memo(function WindowSurface({
     const ctx = ctx2d.current
     if (!ctx) return
     try {
-      ctx.drawImage(frame, 0, 0)
+      ctx.drawImage("video" in frame ? frame.video : frame, 0, 0)
     } catch {
       // Belt and braces for the same race: the check above is the honest test,
       // but a bitmap closed *between* it and here would still throw, and no
@@ -318,7 +334,7 @@ export const WindowSurface = memo(function WindowSurface({
         log(bad ? "warn" : "info", describe(label, reading))
       }
     }
-  }, [frame, label, rect, nativeHdr])
+  }, [frame, label, rect, nativePresentation])
 
   return (
     <div
@@ -584,7 +600,7 @@ export const WindowSurface = memo(function WindowSurface({
         event.preventDefault()
       }}
     >
-      {nativeHdr
+      {nativePresentation
         ? <video ref={nativeVideo} autoPlay muted playsInline className="pointer-events-none block h-full w-full object-fill" />
         : <canvas key={frame && "hdr" in frame ? "hdr" : "sdr"} ref={canvas} className="block h-full w-full" />}
       {/*

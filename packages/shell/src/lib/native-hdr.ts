@@ -6,12 +6,17 @@ function generatorConstructor(): GeneratorConstructor | undefined {
   return (globalThis as typeof globalThis & { MediaStreamTrackGenerator?: GeneratorConstructor }).MediaStreamTrackGenerator
 }
 
+export function nativeVideoAvailable(): boolean { return !!generatorConstructor() }
+export function nativeHdrMetadata(video: VideoFrame): boolean {
+  const color = video.colorSpace
+  return String(color.primaries) === "bt2020" && String(color.transfer) === "pq"
+    && String(color.matrix) === "bt2020-ncl" && color.fullRange === false
+}
+
 /** Opaque hardware frames retain their HDR metadata in native video playback.
  * They cannot be read as planes or imported through a tone-mapping GPU path. */
 export function needsNativeHdr(video: VideoFrame): boolean {
-  const color = video.colorSpace
-  return video.format === null && String(color.primaries) === "bt2020" && String(color.transfer) === "pq"
-    && String(color.matrix) === "bt2020-ncl" && color.fullRange === false && !!generatorConstructor()
+  return video.format === null && nativeHdrMetadata(video) && nativeVideoAvailable()
 }
 
 type Job = { frame: VideoFrame; resolve: () => void; reject: (error: unknown) => void }
@@ -38,8 +43,8 @@ export class NativeHdrPresenter {
     // Let the media element attach its sink before writing an idle window's
     // first (and possibly only) frame; generators do not retain old frames.
     this.#ready = new Promise(resolve => setTimeout(resolve, 0))
-    void video.play().catch(error => { if (!this.#destroyed) failed(`native HDR playback: ${String(error)}`) })
-    log("info", "[hdr] opaque PQ frames use native HDR video presentation")
+    void video.play().catch(error => { if (!this.#destroyed) failed(`native video playback: ${String(error)}`) })
+    log("info", "[presentation] native video presenter started")
   }
 
   draw(video: VideoFrame): Promise<void> {

@@ -305,6 +305,7 @@ export function App(): React.ReactElement {
    */
   const [decodes, setDecodes] = useState<Codec[]>([]);
   const [keyframeRequest, setKeyframeRequest] = useState(0);
+  useEffect(() => { setKeyframeRequest(current => current + 1); }, [streamPrefs.presentation]);
   const availableCodecs = useRef<Codec[]>([]);
   const failedCodecs = useRef(new Set<Codec>());
   useEffect(() => {

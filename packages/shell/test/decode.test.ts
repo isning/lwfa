@@ -168,6 +168,35 @@ describe("the frame decoder", () => {
     decoder.close()
     expect(stats.closed).toBe(2)
   })
+it("keeps SDR decoder frames for native playback and converts subsequent frames after switching back", async () => {
+  const { patchPrefs } = await import("../src/lib/prefs")
+  const convert = vi.fn(async () => ({ close() {} }))
+  vi.stubGlobal("createImageBitmap", convert)
+  vi.stubGlobal("MediaStreamTrackGenerator", class {})
+  const sink = vi.fn()
+  const decoder = new FrameDecoder(sink)
+  try {
+    patchPrefs("stream", { presentation: "video" })
+    await decoder.handle(frame(800,600))
+    const output = { timestamp: 16_667, displayWidth:800, displayHeight:600, close:vi.fn() } as unknown as VideoFrame
+    FakeVideoDecoder.outputs[0]!(output)
+    expect(convert).not.toHaveBeenCalled()
+    expect(sink.mock.calls[0]![1].video).toBe(output)
+    expect(output.close).not.toHaveBeenCalled()
+    sink.mock.calls[0]![1].close()
+    expect(output.close).toHaveBeenCalledOnce()
+    patchPrefs("stream", { presentation: "canvas" })
+    await decoder.handle(frame(800,600,false))
+    FakeVideoDecoder.outputs[0]!({ timestamp:33_334, close:vi.fn() } as unknown as VideoFrame)
+    await Promise.resolve()
+    expect(convert).toHaveBeenCalledOnce()
+  } finally {
+    patchPrefs("stream", { presentation: "auto" })
+    vi.unstubAllGlobals()
+    decoder.close()
+  }
+})
+
 })
 
 

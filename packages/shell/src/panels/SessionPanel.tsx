@@ -1,3 +1,4 @@
+import { usePresentations } from "@/lib/presentation"
 /**
  * What the session is actually doing.
  *
@@ -65,6 +66,9 @@ function SessionPanel() {
   // happening in words rather than showing the internal name of a state.
   const report = describeStatus(status, statusDetail)
   const format = useStreamFormat()
+  const presentations = usePresentations()
+  const presentationPaths = [...new Set(presentations.map(p => p.path))].join(", ")
+  const fallbackReasons = [...new Set(presentations.flatMap(p => p.reason ? [p.reason] : []))]
   const stats = useStreamStats()
   // A page keeps running the JavaScript it loaded until it is reloaded, so an
   // upgraded machine and an open tab disagree until somebody remembers to
@@ -85,11 +89,13 @@ function SessionPanel() {
             <Row label="Status" value={<span className={cn("inline-flex items-center gap-1.5 capitalize", toneClass(report.tone))}><span className="size-1.5 rounded-full bg-current" aria-hidden />{report.label}</span>} />
             {status === "connected" && <Row label="Transport" value={statusDetail ?? "WebSocket (TCP)"} />}
             <Row label="Decode" value={describeFormat(format)} />
+            <Row label="Presentation" value={presentationPaths || "—"} />
             <Row label="Windows" value={windows.size} />
             <Row label="Viewport" value={output.width > 0 ? `${output.width} × ${output.height} logical px` : "Unavailable"} />
             <Row label="Render density" value={output.width > 0 ? `${Number(renderDensity.toFixed(2))}×` : "Unavailable"} />
           </dl>
         </PanelGroup>
+        {fallbackReasons.map(reason => <p key={reason} className="text-xs text-muted-foreground">{reason}</p>)}
         {report.tone === "good" ? null : (
           <p className="text-xs text-muted-foreground">{report.hint}</p>
         )}

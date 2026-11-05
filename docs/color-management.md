@@ -230,3 +230,25 @@ video element. This verifies data flow, not physical monitor brightness.
 The probe rejects lossy external imports in favor of exact plane upload, but
 production acceptance must still include the target browser's actual hardware
 decoder, which may expose different frame formats and resource behavior.
+
+## Presentation preference
+
+Settings → Stream → Presentation selects Auto, Native video or Canvas independently
+of the encoding choice. Auto preserves the existing SDR Canvas2D and HDR WebGPU
+paths, with native video for opaque PQ hardware frames. Native video retains SDR
+VideoFrames instead of creating ImageBitmaps. Canvas uses WebGPU for HDR and
+Canvas2D for SDR. Opaque HDR may still fall back to native video to preserve HDR;
+synthetic linear-tagged HDR frames stay on Canvas for correct color conversion.
+JPEG images use Canvas. Unsupported or failed native playback falls back safely.
+
+The preference is local to the browser and persists across reloads. Changing it
+requests a fresh capture/keyframe so idle windows can switch immediately. Session
+shows the active paths across windows and explains preference fallbacks. A video
+track and its queued frames are released when a window changes presentation or
+unmounts. Selecting native video changes presentation, not the network protocol,
+encoding preference or logical input coordinates.
+
+The browser fixture `scripts/fixtures/presentation-browser.html`, served through
+Vite, exposes `window.runPresentationProbe()`. It mounts the real window surface,
+switches SDR Native video → Canvas2D → Native video without receiving another
+frame, and checks the Canvas pixel values.

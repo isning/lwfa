@@ -375,6 +375,15 @@ function StreamSettings() {
         </PanelGroup>
       </PanelSection>
 
+      <PanelSection title="Presentation" description="Choose how windows are displayed. Unsupported combinations fall back automatically.">
+        <ToggleGroup type="single" value={stream.presentation} onValueChange={value => value && patchPrefs("stream", { presentation: value as typeof stream.presentation })} variant="outline" className="w-full" aria-label="Presentation method">
+          <ToggleGroupItem value="auto" className="h-11 flex-1">Auto</ToggleGroupItem>
+          <ToggleGroupItem value="video" className="h-11 flex-1">Native video</ToggleGroupItem>
+          <ToggleGroupItem value="canvas" className="h-11 flex-1">Canvas</ToggleGroupItem>
+        </ToggleGroup>
+        <p className="text-xs text-muted-foreground">The active presentation method and fallback reason appear in Session.</p>
+      </PanelSection>
+
       <PanelSection
         title="Video quality"
         description="Video uses less bandwidth. JPEG keeps text sharper."

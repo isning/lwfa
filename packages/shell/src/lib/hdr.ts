@@ -12,7 +12,17 @@ export interface HdrFrame {
   readonly video: VideoFrame
   close(): void
 }
-export type DrawableFrame = ImageBitmap | HdrFrame
+export interface NativeVideoFrame {
+  readonly native: true
+  readonly width: number
+  readonly height: number
+  readonly video: VideoFrame
+  close(): void
+}
+export function nativeVideoFrame(video: VideoFrame): NativeVideoFrame {
+  return { native: true, get width() { return video.displayWidth }, get height() { return video.displayHeight }, video, close: () => video.close() }
+}
+export type DrawableFrame = ImageBitmap | HdrFrame | NativeVideoFrame
 export const HDR_CHANGED = "lwfa-hdr-capability-changed"
 let device: GPUDevice | null = null
 let pipeline: GPURenderPipeline | null = null

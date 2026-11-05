@@ -1,0 +1,38 @@
+<!doctype html><meta charset="utf-8"><title>Presentation switching probe</title>
+<div id="root"></div><pre id="result">Ready</pre>
+<script type="module">
+import RefreshRuntime from '/@react-refresh';
+RefreshRuntime.injectIntoGlobalHook(window);
+window.$RefreshReg$ = () => {};
+window.$RefreshSig$ = () => type => type;
+window.__vite_plugin_react_preamble_installed__ = true;
+</script>
+<script type="module">
+import React from '/node_modules/.vite/deps/react.js';
+import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
+const { createRoot } = ReactDOM;
+import { WindowSurface } from '/src/WindowSurface.tsx';
+import { nativeVideoFrame } from '/src/lib/hdr.ts';
+import { patchPrefs } from '/src/lib/prefs.ts';
+import { publishFrame, clearFrames } from '/src/lib/frames.ts';
+window.runPresentationProbe = async () => {
+  const wait = async test => { const start=performance.now(); while(!test()) { if(performance.now()-start>5000) throw Error('presentation switch timed out'); await new Promise(r=>setTimeout(r,10)); } };
+  const root=createRoot(document.querySelector('#root'));
+  const data=new Uint8Array(32*32*4);for(let i=0;i<data.length;i+=4)data.set([170,80,40,255],i);
+  const video=new VideoFrame(data,{format:'RGBA',codedWidth:32,codedHeight:32,timestamp:0});
+  patchPrefs('stream',{presentation:'video'});
+  root.render(React.createElement(WindowSurface,{id:999,rect:{x:0,y:0,width:320,height:320},z:0,filling:false,focused:true,label:'Presentation probe',streamed:true,blank:false,onFocus(){},onInput(){}}));
+  publishFrame(999,nativeVideoFrame(video));
+  try {
+    await wait(()=>document.querySelector('video')?.videoWidth===32);
+    patchPrefs('stream',{presentation:'canvas'});
+    await wait(()=>document.querySelector('canvas')?.width===32);
+    const pixel=Array.from(document.querySelector('canvas').getContext('2d').getImageData(0,0,1,1).data);
+    if(pixel.some((v,i)=>Math.abs(v-[170,80,40,255][i])>1))throw Error('SDR Canvas changed pixels: '+pixel);
+    patchPrefs('stream',{presentation:'video'});
+    await wait(()=>document.querySelector('video')?.videoWidth===32);
+    const result={ok:true,sequence:['Native video','Canvas2D','Native video'],canvasPixel:pixel};
+    document.querySelector('#result').textContent=JSON.stringify(result);return result;
+  } finally { root.unmount(); clearFrames(); patchPrefs('stream',{presentation:'auto'}); }
+};
+</script>

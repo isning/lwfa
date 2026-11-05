@@ -1,4 +1,6 @@
-import { HDR_COLOR_SPACE, hdrFrame, type DrawableFrame } from "@/lib/hdr"
+import { getPrefs } from "@/lib/prefs"
+import { nativeVideoAvailable } from "@/lib/native-hdr"
+import { HDR_COLOR_SPACE, hdrFrame, nativeVideoFrame, type DrawableFrame } from "@/lib/hdr"
 /**
  * Frame decoding for the remote backend.
  *
@@ -225,6 +227,10 @@ export class FrameDecoder {
             // alive until it completes, then release its decoder buffer.
             if (this.#families.get(id) === "hevcHdr") {
               deliver(hdrFrame(videoFrame))
+              return
+            }
+            if (getPrefs().stream.presentation === "video" && nativeVideoAvailable()) {
+              deliver(nativeVideoFrame(videoFrame))
               return
             }
             createImageBitmap(videoFrame)

@@ -240,6 +240,7 @@ export interface Prefs {
      * the alternative is a black window.
      */
     codec: "auto" | "hevc" | "h264" | "jpeg"
+    presentation: "auto" | "video" | "canvas"
     /**
      * Whether to hear the machine.
      *
@@ -354,6 +355,7 @@ export const DEFAULT_PREFS: Prefs = {
   stream: {
     enabled: true,
     codec: "auto",
+    presentation: "auto",
     audio: false,
     volume: 1,
     localPlayback: false,
@@ -400,7 +402,7 @@ function hydrate(raw: unknown): Prefs {
     gamepad: { ...DEFAULT_PREFS.gamepad, ...stored.gamepad },
     keyboard: { ...DEFAULT_PREFS.keyboard, ...stored.keyboard },
     mouse: { ...DEFAULT_PREFS.mouse, ...stored.mouse },
-    stream: { ...DEFAULT_PREFS.stream, ...stored.stream },
+    stream: { ...DEFAULT_PREFS.stream, ...stored.stream, presentation: ["auto", "video", "canvas"].includes(stored.stream?.presentation ?? "") ? stored.stream!.presentation : "auto" },
     motion: { ...DEFAULT_PREFS.motion, ...stored.motion },
     layout: { ...DEFAULT_PREFS.layout, ...stored.layout },
     followEngineScroll: stored.followEngineScroll ?? DEFAULT_PREFS.followEngineScroll,

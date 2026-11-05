@@ -110,3 +110,10 @@ describe("hydrate", () => {
     expect(prefs.nav.anchored).toContain("clipboard")
   })
 })
+
+it.each([undefined, "invalid", null, "auto", "video", "canvas"])("hydrates presentation preference %s safely", async (value) => {
+  vi.resetModules()
+  vi.stubGlobal("localStorage", fakeStorage({ stream: { presentation: value } }))
+  const { getPrefs } = await import("../src/lib/prefs")
+  expect(getPrefs().stream.presentation).toBe(["auto", "video", "canvas"].includes(value as string) ? value : "auto")
+})
