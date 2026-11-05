@@ -45,6 +45,10 @@ calloop = { version = "0.14", features = ["signals"] }
 # bridged into calloop. No async runtime: one socket does not justify it.
 tungstenite = "0.30.0"
 
+# QUIC sessions run outside the compositor event loop.
+wtransport = "0.7.2"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time", "macros"] }
+
 # Only the two codecs lwfa actually uses. PNG for the debug capture dump
 # (lossless, so a wrong-channel-order bug is visible rather than smoothed away)
 # and JPEG for the wire. Hardware H.264 replaces JPEG on the wire later; see

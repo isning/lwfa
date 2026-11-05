@@ -306,9 +306,13 @@ pub fn serve_capabilities(mut stream: TcpStream) {
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let Some(head) = read_head(&mut stream) else { return; };
     let Some((method, _)) = request_line(&head) else { return; };
-    let body = br#"{"codecs":["hevcHdr","hevc","h264"]}"#;
+    let mut capabilities = serde_json::json!({"codecs": ["hevcHdr", "hevc", "h264"]});
+    if let Some(transport) = crate::shell::webtransport::discovery() {
+        capabilities["webtransport"] = transport.clone();
+    }
+    let body = serde_json::to_vec(&capabilities).expect("static capabilities serialize");
     let status = if method == "GET" || method == "HEAD" { 200 } else { 405 };
-    let _ = respond(&mut stream, status, "application/json", body, Some("no-store"), method == "GET");
+    let _ = respond(&mut stream, status, "application/json", &body, Some("no-store"), method == "GET");
 }
 
 pub fn serve(mut stream: TcpStream, root: &Path) {

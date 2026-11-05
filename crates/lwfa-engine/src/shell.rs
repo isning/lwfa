@@ -1,6 +1,6 @@
 //! The shell connection.
 //!
-//! A WebSocket server the shell connects to. The shell sends layout; the engine
+//! WebSocket and optional native WebTransport sessions. The shell sends layout; the engine
 //! sends window lifecycle. See `crates/lwfa-proto` for the wire format.
 //!
 //! # Several connections at once
@@ -33,9 +33,10 @@
 //! open this socket controls the session. A shared token is therefore required
 //! on every connection, whether the socket is on loopback or not. See `auth.rs`.
 //!
-//! There is still **no TLS**. The token and everything after it cross the
+//! The legacy WebSocket listener has **no TLS**. The token and everything after it cross the
 //! network in the clear, so this is safe on a home LAN and not safe on an
-//! untrusted one. Tunnel it until TLS exists.
+//! untrusted one. Serve it through a TLS proxy. Native WebTransport uses TLS
+//! directly; see `shell/webtransport.rs` and `docs/webtransport.md`.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -53,6 +54,7 @@ use lwfa_proto::{SessionId, ToEngine, ToShell, WindowId};
 use smithay::reexports::calloop::channel::Sender as LoopSender;
 
 use crate::auth;
+pub(crate) mod webtransport;
 
 // The listen address is `[net].shell_addr` in `configs/defaults.toml`, and
 // `LWFA_SHELL_ADDR` overrides it. lwfa owns the 6733+ block: 6733 serves the
@@ -263,6 +265,28 @@ struct Slot {
 const MAX_AUDIO_IN_FLIGHT: usize = 3;
 
 impl Slot {
+    fn create(id: SessionId) -> (Arc<Self>, Receiver<Outgoing>) {
+        let (outgoing, receiver) = channel();
+        let slot = Arc::new(Self {
+            id,
+            outgoing,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight_bytes: Arc::new(AtomicUsize::new(0)),
+            audio_in_flight: Arc::new(AtomicUsize::new(0)),
+            connected: Arc::new(AtomicBool::new(true)),
+            streams: Mutex::new(HashSet::new()),
+            hdr: AtomicBool::new(false),
+            audio: AtomicBool::new(false),
+            opus: AtomicBool::new(false),
+            rtt_excess: Arc::new(AtomicU64::new(RTT_UNMEASURED)),
+            delay_congested: Arc::new(AtomicBool::new(false)),
+            answering: Arc::new(AtomicBool::new(false)),
+            superseded: Arc::new(AtomicBool::new(false)),
+            evict: Arc::new(AtomicBool::new(false)),
+        });
+        (slot, receiver)
+    }
+
     fn alive(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -299,6 +323,7 @@ pub struct Clients {
     /// one read drains it, and it cannot block or fill up in any way that
     /// matters here.
     wake: OwnedFd,
+    quic_wake: tokio::sync::Notify,
 }
 
 impl Clients {
@@ -310,6 +335,7 @@ impl Clients {
             // Ids start at 1 so 0 can mean "nobody" in logs and tests.
             next_id: AtomicU64::new(1),
             wake,
+            quic_wake: tokio::sync::Notify::new(),
         }
     }
 
@@ -327,6 +353,7 @@ impl Clients {
 
     /// Wake the connection thread. Failure means only a backstop-length delay.
     fn wake(&self) {
+        self.quic_wake.notify_waiters();
         let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
     }
 
@@ -336,6 +363,11 @@ impl Clients {
 
     fn add(&self, slot: Arc<Slot>) {
         if let Ok(mut slots) = self.slots.lock() {
+            while slots.len() >= MAX_SESSIONS {
+                let oldest = slots.remove(0);
+                oldest.connected.store(false, Ordering::Relaxed);
+                oldest.evict.store(true, Ordering::Relaxed);
+            }
             slots.push(slot);
         }
     }
@@ -678,6 +710,7 @@ impl ShellLink {
         .map_err(std::io::Error::from)?;
         let clients = Arc::new(Clients::new(max_in_flight, wake));
         let thread_clients = Arc::clone(&clients);
+        webtransport::start(clients.clone(), token.clone(), accounts.clone(), events.clone())?;
 
         thread::Builder::new()
             .name("lwfa-shell".into())
@@ -1179,35 +1212,17 @@ fn accept_loop(
                     }
 
                     let id = clients.allocate();
-                    let (outgoing_tx, outgoing_rx) = channel::<Outgoing>();
-                    let in_flight = Arc::new(AtomicUsize::new(0));
-                    let in_flight_bytes = Arc::new(AtomicUsize::new(0));
-                    let audio_in_flight = Arc::new(AtomicUsize::new(0));
-                    let connected = Arc::new(AtomicBool::new(true));
-                    let evict = Arc::new(AtomicBool::new(false));
-                    let superseded = Arc::new(AtomicBool::new(false));
-                    let rtt_excess = Arc::new(AtomicU64::new(RTT_UNMEASURED));
-                    let delay_congested = Arc::new(AtomicBool::new(false));
-                    // Silent until proven otherwise: a client that has not
-                    // answered anything yet is exactly the case this is for.
-                    let answering = Arc::new(AtomicBool::new(false));
-                    clients.add(Arc::new(Slot {
-                        id,
-                        outgoing: outgoing_tx,
-                        in_flight: Arc::clone(&in_flight),
-                        in_flight_bytes: Arc::clone(&in_flight_bytes),
-                        audio_in_flight: Arc::clone(&audio_in_flight),
-                        connected: Arc::clone(&connected),
-                        streams: Mutex::new(HashSet::new()),
-                        hdr: AtomicBool::new(false),
-                        audio: AtomicBool::new(false),
-                        opus: AtomicBool::new(false),
-                        rtt_excess: Arc::clone(&rtt_excess),
-                        delay_congested: Arc::clone(&delay_congested),
-                        answering: Arc::clone(&answering),
-                        superseded: Arc::clone(&superseded),
-                        evict: Arc::clone(&evict),
-                    }));
+                    let (slot, outgoing_rx) = Slot::create(id);
+                    let in_flight = slot.in_flight.clone();
+                    let in_flight_bytes = slot.in_flight_bytes.clone();
+                    let audio_in_flight = slot.audio_in_flight.clone();
+                    let connected = slot.connected.clone();
+                    let evict = slot.evict.clone();
+                    let superseded = slot.superseded.clone();
+                    let rtt_excess = slot.rtt_excess.clone();
+                    let delay_congested = slot.delay_congested.clone();
+                    let answering = slot.answering.clone();
+                    clients.add(slot);
                     live.push(Live {
                         id,
                         socket,
