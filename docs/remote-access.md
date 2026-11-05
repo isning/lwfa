@@ -60,6 +60,9 @@ expose the raw ports to the internet.
 
 ## TLS
 
+For native QUIC sessions, see [WebTransport deployment](webtransport.md).
+Its UDP listener bypasses the HTTP reverse proxy; HTTPS still serves the page.
+
 Not optional beyond the machine itself. `VideoDecoder` and `AudioWorklet` are
 secure-context APIs, so a plain-HTTP page silently loses hardware decode and the
 low-latency audio path. That shows up as "it works, but the picture is worse

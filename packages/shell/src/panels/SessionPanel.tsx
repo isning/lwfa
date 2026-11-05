@@ -83,6 +83,7 @@ function SessionPanel() {
         <PanelGroup asChild>
           <dl>
             <Row label="Status" value={<span className={cn("inline-flex items-center gap-1.5 capitalize", toneClass(report.tone))}><span className="size-1.5 rounded-full bg-current" aria-hidden />{report.label}</span>} />
+            {status === "connected" && <Row label="Transport" value={statusDetail ?? "WebSocket (TCP)"} />}
             <Row label="Decode" value={describeFormat(format)} />
             <Row label="Windows" value={windows.size} />
             <Row label="Viewport" value={output.width > 0 ? `${output.width} × ${output.height}` : "Unavailable"} />

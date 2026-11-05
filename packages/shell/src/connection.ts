@@ -1,5 +1,6 @@
+import { sessionSocket, type SessionSocket } from "./lib/transport"
 /**
- * WebSocket link to the engine.
+ * Authenticated session link to the engine, over QUIC or legacy WebSocket.
  *
  * Thin on purpose: decode, hand off, reconnect. It holds no layout state, so
  * the strip logic stays pure and testable (see `strip.ts`).
@@ -118,7 +119,7 @@ export class Connection {
   #streams: Extract<ToEngine, { type: "setStreams" }> | null = null
   #url: string
   #handlers: ConnectionHandlers
-  #socket: WebSocket | null = null
+  #socket: SessionSocket | null = null
   #retryMs = RECONNECT_MIN_MS
   #timer: ReturnType<typeof setTimeout> | null = null
   #closed = false
@@ -235,7 +236,7 @@ export class Connection {
 
     this.#hdrSupport = undefined
     this.#hdrProbe = null
-    const socket = new WebSocket(this.#url)
+    const socket = sessionSocket(this.#url)
     this.#socket = socket
     // Nothing has arrived on *this* socket yet, and the previous one's clock
     // must not make a fresh connection look overdue on its first tick.
@@ -298,7 +299,7 @@ export class Connection {
 
       if (message.type === "hello") {
         this.#everGreeted = true
-        this.#handlers.onStatus("connected")
+        this.#handlers.onStatus("connected", socket.transport === "webtransport" ? "WebTransport (QUIC/UDP)" : "WebSocket (TCP)")
       }
 
       this.#handlers.onMessage(message)
