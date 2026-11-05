@@ -160,3 +160,26 @@ it("uses datagrams for v2 media and reliable feedback for reference recovery", a
   expect(new Uint8Array(messages[1] as ArrayBuffer)[24]).toBe(4)
   socket.close(); input.close(); control.close()
 })
+
+it("reports early QUIC failure without exposing the authentication URL", async () => {
+  const warning = vi.spyOn(console, "warn").mockImplementation(() => {})
+  try {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ webtransport: { version: 2, port: 6738 } }) })))
+    vi.stubGlobal("WebTransport", vi.fn(function () {
+      return {
+        ready: new Promise(() => {}),
+        closed: Promise.reject(new Error("ERR_METHOD_NOT_SUPPORTED https://desktop.test/session?token=private-password")),
+        close() {},
+      }
+    }))
+    const socket = sessionSocket("wss://desktop.test/?token=private-password")
+    const reason = await new Promise<string>((resolve) => { socket.onclose = (event) => resolve(event.reason) })
+    expect(reason).toContain("ERR_METHOD_NOT_SUPPORTED")
+    expect(reason).toContain("UDP 6738")
+    expect(reason).toContain("proxy bypass")
+    expect(reason).not.toContain("private-password")
+    expect(JSON.stringify(warning.mock.calls)).not.toContain("private-password")
+  } finally {
+    warning.mockRestore()
+  }
+})

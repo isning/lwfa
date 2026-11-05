@@ -182,3 +182,18 @@ actual H.264 decode after dropping an IDR fragment and a whole predictive frame.
 The [WebTransport specification](https://www.w3.org/TR/webtransport/) defines
 unreliable datagrams and the `requireUnreliable` option. The application's
 fragmentation, deadlines and codec recovery above are LWFA protocol behavior.
+
+## Connection troubleshooting
+
+Open the HTTPS shell page, not the UDP session endpoint, and enter the account
+password in the login field. The `token` session query parameter carries that
+password; do not paste session URLs into logs or bug reports.
+
+For Chromium `ERR_METHOD_NOT_SUPPORTED`, first test with HTTP/SOCKS browser and
+system proxies bypassed for the engine hostname. WebTransport needs a direct
+connection; a proxy application's own DIRECT routing rule can still leave the
+browser configured to use an HTTP proxy. Keep the underlying VPN active when
+it supplies connectivity to the engine. This error can also indicate HTTP/3
+WebTransport negotiation failure, so proxy bypass alone is not a diagnosis.
+For timeouts, check reachability of the advertised **UDP** port and certificate
+validity. Successful HTTPS page loading only verifies the separate TCP listener.

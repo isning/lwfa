@@ -364,7 +364,9 @@ export class Connection {
         // Retry, and say honestly that it could be either.
         this.#handlers.onStatus(
           "unreachable",
-          "the engine did not accept the connection: it may be down, or the password may be wrong",
+          socket.transport === "webtransport" && event.reason
+            ? event.reason
+            : "the engine did not accept the connection: it may be down, or the password may be wrong",
         )
         this.#scheduleReconnect()
         return

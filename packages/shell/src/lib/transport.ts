@@ -121,6 +121,20 @@ class QuicSocket implements SessionSocket {
   #packets: MediaDatagrams | null = null
   #expiry: ReturnType<typeof setInterval> | null = null
   #abort = new AbortController()
+  #endpointPort = "unknown"
+
+  #failure(error: unknown): void {
+    if (this.readyState === 3) return
+    // Native errors may contain the credential-bearing URL. Only retain a
+    // recognized network error code, never the raw message or exception.
+    const message = error instanceof Error ? error.message : ""
+    const code = message.match(/\bERR_[A-Z_]+\b/)?.[0]
+    const timeout = message === "QUIC handshake timed out"
+    const reason = `WebTransport ${timeout ? "handshake timed out" : "connection failed"}${code ? ` (${code})` : ""}; check browser proxy bypass, UDP ${this.#endpointPort}, TLS and login password`
+    console.warn("LWFA WebTransport failed:", reason)
+    this.onerror?.()
+    this.#end(reason, 1006)
+  }
   constructor(private url: string, private ctor: QuicConstructor) { void this.#start() }
 
   async #start(): Promise<void> {
@@ -142,6 +156,7 @@ class QuicSocket implements SessionSocket {
       const endpoint = new URL(this.url)
       endpoint.protocol = "https:"
       endpoint.port = String(info.port)
+      this.#endpointPort = endpoint.port
       endpoint.pathname = "/session"
       const session = new this.ctor(endpoint.toString(), {
         ...(Array.isArray(hash) ? { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(hash) }] } : {}),
@@ -150,7 +165,7 @@ class QuicSocket implements SessionSocket {
       })
       this.#session = session
       // Attach rejection handling immediately, including handshake failures.
-      void session.closed.then((info) => this.#end(info.reason, info.closeCode), () => this.#end("QUIC connection failed", 1006))
+      void session.closed.then((info) => this.#end(info.reason, info.closeCode), (error: unknown) => this.#failure(error))
       await Promise.race([session.ready, new Promise<never>((_, reject) => {
         const signal = AbortSignal.any([this.#abort.signal, AbortSignal.timeout(8000)])
         signal.addEventListener("abort", () => reject(new Error("QUIC handshake timed out")), { once: true })
@@ -192,11 +207,9 @@ class QuicSocket implements SessionSocket {
         this.#fallback()
         return
       }
-      console.warn("LWFA WebTransport failed:", error)
       // An advertised endpoint failing must be visible, not quietly return
       // to TCP and pretend the requested QUIC transport is working.
-      this.onerror?.()
-      this.#end("WebTransport unavailable; check UDP and TLS", 1006)
+      this.#failure(error)
     }
   }
 
