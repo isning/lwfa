@@ -1,5 +1,8 @@
 /// <reference types="@webgpu/types" />
-/** HDR presentation stays on VideoFrame -> external texture -> float canvas.
+import { HDR_SHADER } from "./hdr-shader"
+import { HdrPlanes } from "./hdr-planes"
+/** HDR presentation stays in 10-bit/float precision, including planar upload
+ * when external texture import fails the numeric color/precision probe.
  * ImageBitmap/8-bit 2D intermediates would discard highlights. */
 export interface HdrFrame {
   readonly hdr: true
@@ -14,15 +17,14 @@ let device: GPUDevice | null = null
 let pipeline: GPURenderPipeline | null = null
 let initializing: Promise<boolean> | null = null
 let failed = false
+let externalImport = false
+let planesPipeline: GPURenderPipeline | null = null
+const planePresenters = new WeakMap<HTMLCanvasElement, HdrPlanes>()
 const contexts = new WeakMap<HTMLCanvasElement, GPUCanvasContext>()
 const shader = `
 @group(0) @binding(0) var image: texture_external;
 @group(0) @binding(1) var imageSampler: sampler;
-struct Vertex { @builtin(position) position: vec4f, @location(0) uv: vec2f }
-@vertex fn vs(@builtin(vertex_index) index: u32) -> Vertex {
-  let p = array(vec2f(-1.0,-1.0), vec2f(3.0,-1.0), vec2f(-1.0,3.0))[index];
-  return Vertex(vec4f(p,0.0,1.0), vec2f((p.x+1.0)*0.5,(1.0-p.y)*0.5));
-}
+${HDR_SHADER}
 @fragment fn fs(vertex: Vertex) -> @location(0) vec4f {
   // Decoder outputs are deliberately tagged linear BT.709, while retaining
   // the BT.2020 YUV matrix. Import into sRGB only applies its OETF. Undo it
@@ -30,13 +32,7 @@ struct Vertex { @builtin(position) position: vec4f, @location(0) uv: vec2f }
   let encoded = textureSampleBaseClampToEdge(image, imageSampler, vertex.uv);
   let v = max(encoded.rgb, vec3f(0.0));
   let pq = select(v / 12.92, pow((v + 0.055) / 1.055, vec3f(2.4)), v > vec3f(0.04045));
-  let p = pow(pq, vec3f(1.0 / 78.84375));
-  let nits = pow(max(p - 0.8359375, vec3f(0.0)) / (18.8515625 - 18.6875 * p), vec3f(1.0 / 0.1593017578125)) * 10000.0;
-  let p3 = mat3x3f(vec3f(1.343578,-0.065298,0.002822), vec3f(-0.282180,1.075788,-0.019599), vec3f(-0.061398,-0.010490,1.016777)) * (nits / 203.0);
-  // Extended Display-P3 uses the extended sRGB transfer, not linear values.
-  let a = abs(p3);
-  let output = sign(p3) * select(a * 12.92, 1.055 * pow(a,vec3f(1.0/2.4)) - 0.055, a > vec3f(0.0031308));
-  return vec4f(output, 1.0);
+  return present_pq(pq);
 }`
 let sampler: GPUSampler | null = null
 
@@ -70,7 +66,15 @@ export async function supportsHdr(): Promise<boolean> {
         primitive: { topology: "triangle-list" },
       })
       sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" })
-      if (!await probeImport()) return false
+      try { externalImport = await probeImport((video,view) => render(video,view)) }
+      catch { externalImport = false }
+      if (!externalImport) {
+        planesPipeline = await HdrPlanes.pipeline(device)
+        const planes = new HdrPlanes(device,planesPipeline)
+        try { if (!await probeImport((video,view) => planes.draw(video,()=>view,()=>true))) return false }
+        finally { planes.destroy() }
+        console.info("HDR uses exact 10-bit plane upload: external import failed its color/precision probe")
+      }
       void device.lost.then(disableHdr)
       device.addEventListener("uncapturederror", disableHdr)
       return true
@@ -79,7 +83,7 @@ export async function supportsHdr(): Promise<boolean> {
   return initializing
 }
 
-export function drawHdr(canvas: HTMLCanvasElement, frame: HdrFrame): void {
+export async function drawHdr(canvas: HTMLCanvasElement, frame: HdrFrame): Promise<void> {
   if (!device || !pipeline || !sampler || failed) { disableHdr(); return }
   try {
     if (String(frame.video.colorSpace.transfer) !== "linear" || frame.video.colorSpace.primaries !== "bt709") throw new Error("decoder did not preserve the HDR sample container")
@@ -90,42 +94,64 @@ export function drawHdr(canvas: HTMLCanvasElement, frame: HdrFrame): void {
       context.configure({ device, format: "rgba16float", colorSpace: "display-p3", toneMapping: { mode: "extended" }, alphaMode: "opaque" })
       contexts.set(canvas, context)
     }
-    render(frame.video, context.getCurrentTexture().createView())
+    if (externalImport) render(frame.video, context.getCurrentTexture().createView())
+    else {
+      if (!planesPipeline) throw new Error("HDR plane pipeline unavailable")
+      let presenter = planePresenters.get(canvas)
+      if (!presenter) { presenter = new HdrPlanes(device,planesPipeline); planePresenters.set(canvas,presenter) }
+      const target = context
+      await presenter.draw(frame.video,()=>target.getCurrentTexture().createView(),()=>!failed)
+    }
   } catch { disableHdr() }
 }
 
 function render(video: VideoFrame, view: GPUTextureView): void {
   if (!device || !pipeline || !sampler) throw new Error("HDR device unavailable")
-    const image = device.importExternalTexture({ source: video, colorSpace: "srgb" })
-    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: image }, { binding: 1, resource: sampler }] })
-    const encoder = device.createCommandEncoder()
-    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: view, loadOp: "clear", storeOp: "store", clearValue: [0,0,0,1] }] })
-    pass.setPipeline(pipeline)
-    pass.setBindGroup(0, group)
-    pass.draw(3)
-    pass.end()
-    device.queue.submit([encoder.finish()])
+  const image = device.importExternalTexture({ source: video, colorSpace: "srgb" })
+  const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: image }, { binding: 1, resource: sampler }] })
+  const encoder = device.createCommandEncoder()
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: view, loadOp: "clear", storeOp: "store", clearValue: [0,0,0,1] }] })
+  pass.setPipeline(pipeline)
+  pass.setBindGroup(0, group)
+  pass.draw(3)
+  pass.end()
+  device.queue.submit([encoder.finish()])
 }
 
 /** Validate the actual external-texture conversion, not just canvas allocation.
  * Some browsers accept float HDR canvases but tone-map PQ imports to SDR. */
-async function probeImport(): Promise<boolean> {
+async function probeImport(draw: (video: VideoFrame, view: GPUTextureView) => void | Promise<void>): Promise<boolean> {
   if (!device) return false
-  const data = new Uint16Array([723,723,723,723,512,512]) // 1000-nit gray
-  const video = new VideoFrame(data, { format: "I420P10" as VideoPixelFormat, codedWidth: 2, codedHeight: 2, timestamp: 0, colorSpace: HDR_COLOR_SPACE })
-  const texture = device.createTexture({ size: [2,2], format: "rgba16float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC })
-  const buffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
-  try {
-    render(video, texture.createView())
-    const encoder = device.createCommandEncoder()
-    encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [2,2])
-    device.queue.submit([encoder.finish()])
-    await buffer.mapAsync(GPUMapMode.READ)
-    const word = new Uint16Array(buffer.getMappedRange())[0]!
-    // Positive finite binary16 between 1.8 and 2.2, approximately 1000/203
-    // nits with extended sRGB encoding. SDR clipping or tone mapping fails.
-    return word >= 0x3f33 && word <= 0x4066
-  } finally { video.close(); buffer.destroy(); texture.destroy() }
+  // Expected float Display-P3 values are computed from the quantized YUV words,
+  // not the unquantized source. Saturated blue detects matrix/upload errors;
+  // gray catches loss of highlight precision or browser HDR tone mapping.
+  for (const [words,expected] of [
+    [[723,723,723,723,512,512],[1.9987744,1.9987744,1.9987744]],
+    [[508,508,508,508,649,471],[-0.5451187,0.6917263,2.3738728]],
+  ]) {
+    const video = new VideoFrame(new Uint16Array(words!), { format: "I420P10" as VideoPixelFormat, codedWidth: 2, codedHeight: 2, timestamp: 0, colorSpace: HDR_COLOR_SPACE })
+    const texture = device.createTexture({ size: [2,2], format: "rgba16float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC })
+    const buffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
+    try {
+      await draw(video,texture.createView())
+      const encoder = device.createCommandEncoder()
+      encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [2,2])
+      device.queue.submit([encoder.finish()])
+      await buffer.mapAsync(GPUMapMode.READ)
+      const pixel = new Uint16Array(buffer.getMappedRange())
+      for (let channel=0;channel<3;channel++) {
+        const word=pixel[channel]!, sign=word&0x8000?-1:1, exponent=(word>>10)&31, fraction=word&1023
+        const value=sign*(exponent === 0 ? fraction*2**-24 : (1+fraction/1024)*2**(exponent-15))
+        if (!Number.isFinite(value) || Math.abs(value-expected![channel]!)>0.006) return false
+      }
+    } finally { video.close(); buffer.destroy(); texture.destroy() }
+  }
+  return true
+}
+
+/** Useful for diagnostics; never advertises HDR without passing its probe. */
+export function hdrPresentationPath(): "external" | "planes" | null {
+  return failed || !pipeline ? null : externalImport ? "external" : planesPipeline ? "planes" : null
 }
 
 export function hdrFrame(video: VideoFrame): HdrFrame {

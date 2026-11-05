@@ -271,7 +271,7 @@ export const WindowSurface = memo(function WindowSurface({
       el.height = frame.height
     }
 
-    if ("hdr" in frame) { drawHdr(el, frame); return }
+    if ("hdr" in frame) { void drawHdr(el, frame); return }
 
     // Looked up once per canvas, not per frame. The browser caches the
     // context internally, but the lookup plus its options object were still

@@ -66,6 +66,11 @@ reading the packed words. Without normalized16 rendering, the portable RGB10
 readback/conversion remains available. Normalized16 is an internal GL format,
 not a fabricated or advertised DRM fourcc.
 
+P010 chroma is averaged over 2×2 blocks and reconstructed at pixel centers.
+FFmpeg's `hevc_metadata` bitstream filter signals centered chroma in HEVC VUI;
+setting the codec option alone is ignored by some NVENC SDK builds. This changes
+metadata without re-encoding or reading GPU pixels.
+
 Every HDR IDR contains HDR10 mastering-display and content-light prefix SEI,
 independent of the NVENC SDK version. Metadata describes the **composited**
 virtual BT.2020/D65 display (0–10000 cd/m²), not one application's mastering
@@ -95,10 +100,18 @@ BT.709 while keeping the real BT.2020 limited-range YUV matrix. Importing into
 sRGB then applying its inverse transfer recovers the PQ RGB code values; our
 shader applies PQ EOTF, BT.2020 → P3 conversion and extended sRGB encoding at
 203-nit white. This avoids browser-dependent PQ import tone mapping. These
-internal frames must never enter ordinary image/Canvas2D paths. Capability
-negotiation includes an actual 1000-nit synthetic frame render/readback, in
-addition to checking canvas configuration. No SDR ImageBitmap intermediate is
-used. Ordinary SDR/JPEG frames keep the 2D canvas path.
+internal frames must never enter ordinary image/Canvas2D paths.
+
+Capability negotiation reads back both a 1000-nit gray and saturated blue from
+the actual pipeline. It compares all RGB components with references derived
+from quantized YUV input. Browsers whose external importer loses precision or
+misinterprets the matrix instead copy the original 10-bit YUV planes, upload
+three `r16uint` textures and perform YUV/PQ/P3 conversion in WGSL. This fallback
+copies raw plane bytes on the browser CPU; it never converts through RGB8.
+The queue retains one active copy plus one latest frame, closes replaced frames,
+and owns a clone so decoder frames may be closed immediately. Unsupported plane
+access or operational failures downgrade to SDR. `hdrPresentationPath()` reports
+which verified path is active. No SDR ImageBitmap intermediate is used. Ordinary SDR/JPEG frames keep the 2D canvas path.
 
 HDR is selected through the Auto codec preference. Pinning HEVC or H.264 selects
 the existing SDR formats. HTTPS/secure-context requirements still apply.
@@ -185,6 +198,6 @@ real WebGPU and 10-bit planar VideoFrames, checks float samples at 203/1000/4000
 cd/m² and verifies downgrade. It **emulates** HDR display detection, so passing
 proves numeric presentation, not physical monitor appearance. A real HDR display,
 OS/browser HDR configuration and supported Main10 decoder remain required for
-user-visible HDR. Browser-internal upload precision can differ between software
-frames and hardware-decoded GPU frames; production workload validation should
-include the target browser/GPU.
+user-visible HDR. The probe rejects lossy external imports in favor of exact plane upload, but
+production acceptance must still include the target browser's actual hardware
+decoder, which may expose different frame formats and resource behavior.

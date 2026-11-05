@@ -2,7 +2,8 @@
 <p>This fixture emulates HDR display capability; it does not test physical display brightness.</p>
 <canvas id="hdr" width="2" height="2"></canvas><pre id="result">Ready</pre>
 <script type="module">
-import { supportsHdr, drawHdr, hdrFrame, HDR_CHANGED } from '/src/lib/hdr.ts';
+import { HdrPlanes } from '/src/lib/hdr-planes.ts';
+import { supportsHdr, drawHdr, hdrFrame, HDR_CHANGED, hdrPresentationPath } from '/src/lib/hdr.ts';
 const originalMatchMedia = window.matchMedia.bind(window);
 window.matchMedia = query => query === '(dynamic-range: high)' ? { matches: true } : originalMatchMedia(query);
 let device;
@@ -24,14 +25,20 @@ window.runHdrProbe = async (failure = "device") => {
     return sign*(exp === 0 ? frac*2**-24 : (1+frac/1024)*2**(exp-15));
   }
   const samples = [];
-  for (const nits of [203,1000,4000]) {
-    const p = (nits/10000)**(2610/16384);
-    const pq = ((3424/4096+2413/128*p)/(1+2392/128*p))**(2523/32);
+  for (const rgb of [[203,203,203],[1000,1000,1000],[4000,4000,4000],[1000,100,20],[50,100,1500]]) {
+    const nits=rgb[0];
+    const pq=rgb.map(nits=>{
+      const p=(nits/10000)**(2610/16384);
+      return ((3424/4096+2413/128*p)/(1+2392/128*p))**(2523/32);
+    });
+    const y=.2627*pq[0]+.6780*pq[1]+.0593*pq[2];
     const words = new Uint16Array(6);
-    words.fill(Math.round(64+876*pq),0,4); words[4]=words[5]=512;
+    words.fill(Math.round(64+876*y),0,4);
+    words[4]=Math.round(512+896*(pq[2]-y)/1.8814);
+    words[5]=Math.round(512+896*(pq[0]-y)/1.4746);
     const video = new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
     const frame = hdrFrame(video);
-    drawHdr(canvas,frame);
+    await drawHdr(canvas,frame);
     const output = context.getCurrentTexture();
     const buffer = device.createBuffer({size:512,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
     const encoder = device.createCommandEncoder();
@@ -39,25 +46,58 @@ window.runHdrProbe = async (failure = "device") => {
     device.queue.submit([encoder.finish()]);
     await buffer.mapAsync(GPUMapMode.READ);
     const pixel = Array.from(new Uint16Array(buffer.getMappedRange()).slice(0,4),half);
-    samples.push({nits,pixel,colorSpace:video.colorSpace.toJSON()});
+    samples.push({nits,rgb,pixel,colorSpace:video.colorSpace.toJSON()});
     buffer.unmap();buffer.destroy();frame.close();
   }
   for (const sample of samples) {
-    const expected=1.055*(sample.nits/203)**(1/2.4)-0.055;
-    if (Math.abs(sample.pixel[0]-expected)/expected>0.025) throw Error('Incorrect luminance: '+JSON.stringify(samples));
+    const matrix=[[1.343578,-.282180,-.061398],[-.065298,1.075788,-.010490],[.002822,-.019599,1.016777]];
+    const expected=matrix.map(row=>{
+      const v=row.reduce((sum,c,i)=>sum+c*sample.rgb[i],0)/203;
+      return Math.sign(v)*(Math.abs(v)<=.0031308?12.92*Math.abs(v):1.055*Math.abs(v)**(1/2.4)-.055);
+    });
+    for (let channel=0;channel<3;channel++) {
+      if (Math.abs(sample.pixel[channel]-expected[channel])>Math.max(.025,Math.abs(expected[channel])*.01)) throw Error('Incorrect color/luminance: '+JSON.stringify({sample,expected}));
+    }
   }
   if (!(samples[1].pixel[0]>1.1 && samples[2].pixel[0]>samples[1].pixel[0])) throw Error('Highlights clipped: '+JSON.stringify(samples));
+  // Hold one copy in flight and submit two replacements. The uploader must
+  // close the superseded clone, retain at most two, and accept immediate
+  // closure of every original decoder frame.
+  const uploader=new HdrPlanes(device,await HdrPlanes.pipeline(device));
+  const texture=device.createTexture({size:[2,2],format:'rgba16float',usage:GPUTextureUsage.RENDER_ATTACHMENT});
+  let release;
+  const gate=new Promise(resolve=>release=resolve);
+  const clones=[];
+  let copies=0;
+  const jobs=[];
+  for (let i=0;i<3;i++) {
+    const video=new VideoFrame(new Uint16Array([723,723,723,723,512,512]),{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:i,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
+    const clone=video.clone.bind(video);
+    video.clone=()=>{
+      const owned=clone(),copy=owned.copyTo.bind(owned); clones.push(owned);
+      owned.copyTo=async(...args)=>{ if (++copies===1) await gate; return copy(...args); };
+      return owned;
+    };
+    jobs.push(uploader.draw(video,()=>texture.createView(),()=>true));
+    video.close();
+  }
+  await jobs[1];
+  if (copies!==1 || clones.filter(frame=>frame.codedWidth>0).length!==2 || clones[1].codedWidth!==0) throw Error('Unbounded frame queue or missing replacement cleanup');
+  release(); await Promise.all(jobs);
+  if (copies!==2 || clones.some(frame=>frame.codedWidth!==0)) throw Error('Frame lifetime leak');
+  uploader.destroy();texture.destroy();
+  const path=hdrPresentationPath();
   let changes=0;
   window.addEventListener(HDR_CHANGED,()=>changes++);
   if (failure === "context") {
     const incompatible=document.createElement('canvas'); incompatible.getContext('2d');
     const words=new Uint16Array([723,723,723,723,512,512]);
     const video=new VideoFrame(words,{format:'I420P10',codedWidth:2,codedHeight:2,timestamp:0,colorSpace:{primaries:'bt709',transfer:'linear',matrix:'bt2020-ncl',fullRange:false}});
-    drawHdr(incompatible,hdrFrame(video)); video.close();
+    await drawHdr(incompatible,hdrFrame(video)); video.close();
   } else { device.destroy(); await device.lost; await Promise.resolve(); }
   if (changes !== 1) throw Error('Capability change event missing');
   if (await supportsHdr()) throw Error('Downgrade failed');
-  document.querySelector('#result').textContent=JSON.stringify({ok:true,samples},null,2);
-  return {ok:true,samples};
+  document.querySelector('#result').textContent=JSON.stringify({ok:true,path,samples},null,2);
+  return {ok:true,path,samples};
 };
 </script>
