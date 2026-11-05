@@ -232,6 +232,21 @@ export function wheelDelta(event: WheelEvent): { horizontal: number; vertical: n
   }
 }
 
+type NativeWheel = WheelEvent & {
+  momentum?: boolean
+  wheelDeltaX?: number
+  wheelDeltaY?: number
+}
+
+/** Some macOS wheel events expose 120-pixel steps with -360 legacy units. */
+function pixelDetent(event: NativeWheel): boolean {
+  if (event.deltaMode !== 0 || (event.deltaX !== 0 && event.deltaY !== 0)) return false
+  const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX
+  const legacy = event.deltaY !== 0 ? event.wheelDeltaY : event.wheelDeltaX
+  return delta !== 0 && Math.abs(delta) % 120 === 0 &&
+    typeof legacy === "number" && Math.abs(legacy + 3 * delta) < 0.01
+}
+
 /**
  * Infer scroll semantics for the web client only. The DOM has no authoritative
  * mouse/trackpad discriminator. Prefer explicit units and native momentum;
@@ -239,11 +254,7 @@ export function wheelDelta(event: WheelEvent): { horizontal: number; vertical: n
  * Ambiguous/high-resolution input stays continuous and is not quantized.
  */
 export function wheelSource(event: WheelEvent): "wheel" | "continuous" {
-  const native = event as WheelEvent & {
-    momentum?: boolean
-    wheelDeltaX?: number
-    wheelDeltaY?: number
-  }
+  const native = event as NativeWheel
   if (native.momentum === true || event.ctrlKey) return "continuous"
   if (event.deltaMode === 1 || event.deltaMode === 2) return "wheel"
   // Diagonal travel is usually a continuous gesture. Do not turn it into
@@ -252,10 +263,30 @@ export function wheelSource(event: WheelEvent): "wheel" | "continuous" {
   const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX
   const legacy = event.deltaY !== 0 ? native.wheelDeltaY : native.wheelDeltaX
   if (delta === 0 || typeof legacy !== "number" || !Number.isFinite(legacy)) return "continuous"
-  // Chromium maps precise pixel movement to legacy wheelDelta at -3x.
-  // Check this first: a touchpad delta of 40 can also look like a 120 detent.
+  // -3x legacy metadata also occurs for ordinary macOS mouse wheels; the
+  // reported fixed 120-pixel steps must take precedence over that ratio.
+  if (pixelDetent(native)) return "wheel"
   if (Math.abs(legacy + 3 * delta) < 0.01) return "continuous"
   return legacy !== 0 && Math.abs(legacy) % 120 === 0 ? "wheel" : "continuous"
+}
+
+/** Short gesture history, never a persistent physical-device assignment. */
+export class WheelClassifier {
+  #lastAt = -Infinity
+  #continuous = false
+
+  source(event: WheelEvent, now = performance.now()): "wheel" | "continuous" {
+    // A new operation after idle can come from a different device. Keep a
+    // continuous burst continuous if one large sample happens to equal a
+    // wheel step, but never carry that inference across separate gestures.
+    if (now - this.#lastAt > 180 || now < this.#lastAt) this.#continuous = false
+    this.#lastAt = now
+    const candidate = wheelSource(event)
+    const source = candidate === "wheel" && this.#continuous && pixelDetent(event)
+      ? "continuous" : candidate
+    this.#continuous = source === "continuous"
+    return source
+  }
 }
 
 /**

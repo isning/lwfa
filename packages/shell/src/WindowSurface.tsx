@@ -20,7 +20,7 @@ import { drawHdr } from "@/lib/hdr"
 import { tap } from "@/lib/haptics"
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react"
 import type { Rect, WindowId } from "@lwfa/proto"
-import { edgeLeave, edgePark, evdevFromButton, wheelDelta, wheelSource, windowPoint } from "./input.js"
+import { edgeLeave, edgePark, evdevFromButton, wheelDelta, WheelClassifier, windowPoint } from "./input.js"
 import { describe, measure, probeEnabled } from "@/lib/captureProbe"
 import { LongPress } from "@/lib/longPress"
 import { useDock } from "@/lib/dock"
@@ -160,6 +160,7 @@ export const WindowSurface = memo(function WindowSurface({
     [rect.width, rect.height],
   )
   const box = useRef<HTMLDivElement>(null)
+  const wheel = useRef(new WheelClassifier())
   // Subscribed per window, so a frame for another window does not re-render
   // this one. See lib/frames.ts.
   const frame = useFrame(id)
@@ -231,7 +232,7 @@ export const WindowSurface = memo(function WindowSurface({
     if (!element) return
     const onWheel = (event: WheelEvent) => {
       event.preventDefault()
-      send({ kind: "axis", ...wheelDelta(event), source: wheelSource(event) })
+      send({ kind: "axis", ...wheelDelta(event), source: wheel.current.source(event) })
     }
     element.addEventListener("wheel", onWheel, { passive: false })
     return () => element.removeEventListener("wheel", onWheel)

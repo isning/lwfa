@@ -412,8 +412,12 @@ needs an SSH or WireGuard tunnel.
 
 The browser infers scroll **semantics per event**, not a permanent device type.
 `wheelSource` recognizes line/page steps and Chromium's legacy 120-unit detent
-metadata, while native `WheelEvent.momentum`, precise proportional deltas,
-diagonal gestures and ambiguous pixel events remain continuous. This is a
+metadata and fixed 120-pixel steps, including macOS events whose legacy value
+is -360. A -3x legacy ratio alone does not prove touchpad input. Native
+`WheelEvent.momentum`, other precise proportional deltas, diagonal gestures and
+ambiguous pixel events remain continuous. A short per-window gesture history
+keeps a continuous burst continuous when one sample equals a wheel step; it
+expires after 180ms idle so a different device can start the next operation. This is a
 best-effort browser heuristic: high-resolution wheels, driver remapping and
 browsers without detent metadata can be ambiguous. Native clients can supply
 operation semantics directly without running this browser heuristic.

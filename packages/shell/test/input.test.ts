@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest"
-import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, wheelDelta, wheelSource, windowPoint } from "../src/input"
+import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, wheelDelta, wheelSource, WheelClassifier, windowPoint } from "../src/input"
 
 /** A DOM-free stand-in, since these run in node. */
 class FakeElement {
@@ -285,5 +285,34 @@ describe("scroll operation classification", () => {
   it("recognizes horizontal detents without classifying diagonal gestures as wheels", () => {
     expect(source(0, { deltaX: 100, wheelDeltaX: -120 })).toBe("wheel")
     expect(source(40, { deltaX: 20, wheelDeltaX: -60, wheelDeltaY: -120 })).toBe("continuous")
+  })
+})
+
+
+describe("real macOS wheel regression", () => {
+  const event = (deltaY: number, extra: object = {}) => ({ deltaX: 0, deltaY, deltaMode: 0, ctrlKey: false, wheelDeltaY: -3 * deltaY, ...extra }) as unknown as WheelEvent
+  it("does not assume proportional legacy metadata proves touchpad input", () => {
+    expect(wheelSource(event(120))).toBe("wheel")
+    expect(wheelSource(event(-120))).toBe("wheel")
+  })
+  it("recognizes the reported fixed 120-pixel steps even with -3x legacy deltas", () => {
+    const classifier = new WheelClassifier()
+    for (const [i, delta] of [120, 120, 120, -120, -120, -120, 120].entries()) {
+      expect(classifier.source(event(delta), i * 30)).toBe("wheel")
+    }
+  })
+  it("does not turn one large sample inside a continuous gesture into a wheel", () => {
+    const classifier = new WheelClassifier()
+    for (const [i, delta] of [0.4, 4, 40, 120, 80, 4].entries()) {
+      expect(classifier.source(event(delta), i * 16)).toBe("continuous")
+    }
+  })
+  it("forgets gesture history after a gap so a different device can take over", () => {
+    const classifier = new WheelClassifier()
+    expect(classifier.source(event(0.4), 0)).toBe("continuous")
+    expect(classifier.source(event(120), 300)).toBe("wheel")
+    expect(classifier.source(event(0.4), 316)).toBe("continuous")
+    expect(classifier.source(event(120, { momentum: true }), 332)).toBe("continuous")
+    expect(classifier.source(event(-120), 700)).toBe("wheel")
   })
 })
