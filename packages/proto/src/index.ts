@@ -92,7 +92,12 @@ export interface Modifiers {
   logo: boolean
 }
 
+export interface PerformanceStage { name: string; samples: number; p50: number; p95: number; max: number }
+export interface PerformanceCounter { name: string; value: number }
+export interface PerformanceReport { type: "performance"; nonce: number; stages: PerformanceStage[]; counters: PerformanceCounter[]; transportRttMs: number | null }
+
 export type ToShell =
+  | PerformanceReport
   | { type: "gaming"; request: number; data: unknown; error: string | null }
   | {
       type: "hello"
@@ -492,6 +497,7 @@ export interface AppEntry {
 }
 
 export type ToEngine =
+  | { type: "performanceProbe"; nonce: number }
   | { type: "setLayout"; windows: WindowLayout[]; animate: Animation | null }
   | { type: "focusWindow"; id: WindowId }
   | { type: "closeWindow"; id: WindowId }
@@ -1378,6 +1384,29 @@ export function decodeToShell(text: string): ToShell {
         more: bool(o, "more", where),
       }
     }
+    case "performance": {
+      noExtraKeys(o, ["type", "nonce", "stages", "counters", "transportRttMs"], at)
+      const nonce = performanceNumber(o, "nonce", at, true, 0xffffffff)
+      const entries = (key: string) => {
+        const values = array(o, key, at)
+        if (values.length > 64) throw new ProtocolError(`${at}.${key}: too many metrics`)
+        return values
+      }
+      const stages = entries("stages").map((value, index) => {
+        const where = `${at}.stages[${index}]`, item = asObject(value, where)
+        noExtraKeys(item, ["name", "samples", "p50", "p95", "max"], where)
+        const result = { name: performanceName(item, where), samples: performanceNumber(item, "samples", where, true, 0xffffffff), p50: performanceNumber(item, "p50", where), p95: performanceNumber(item, "p95", where), max: performanceNumber(item, "max", where) }
+        if (result.p50 > result.p95 || result.p95 > result.max) throw new ProtocolError(`${where}: invalid percentile order`)
+        return result
+      })
+      const counters = entries("counters").map((value, index) => {
+        const where = `${at}.counters[${index}]`, item = asObject(value, where)
+        noExtraKeys(item, ["name", "value"], where)
+        return { name: performanceName(item, where), value: performanceNumber(item, "value", where, true) }
+      })
+      const transportRttMs = o.transportRttMs === null ? null : performanceNumber(o, "transportRttMs", at)
+      return { type: "performance", nonce, stages, counters, transportRttMs }
+    }
     case "pong": {
       noExtraKeys(o, ["type"], `${at}.pong`)
       return { type: "pong" }
@@ -1833,6 +1862,10 @@ export function decodeToEngine(text: string): ToEngine {
       noExtraKeys(o, ["type"], `${at}.clipClear`)
       return { type: "clipClear" }
     }
+    case "performanceProbe": {
+      noExtraKeys(o, ["type", "nonce"], at)
+      return { type: "performanceProbe", nonce: performanceNumber(o, "nonce", at, true, 0xffffffff) }
+    }
     case "ping": {
       noExtraKeys(o, ["type"], `${at}.ping`)
       return { type: "ping" }
@@ -1840,6 +1873,17 @@ export function decodeToEngine(text: string): ToEngine {
     default:
       throw new ProtocolError(`${at}: unknown message type ${JSON.stringify(t)}`)
   }
+}
+
+function performanceNumber(o: Obj, key: string, at: string, integer = false, max = Number.MAX_SAFE_INTEGER): number {
+  const value = integer ? int(o, key, at) : num(o, key, at)
+  if (value < 0 || value > max) throw new ProtocolError(`${at}.${key}: out of range`)
+  return value
+}
+function performanceName(o: Obj, at: string): string {
+  const name = str(o, "name", at)
+  if (!/^[a-zA-Z][a-zA-Z0-9]{0,63}$/.test(name)) throw new ProtocolError(`${at}.name: invalid metric name`)
+  return name
 }
 
 function parse(text: string, at: string): unknown {

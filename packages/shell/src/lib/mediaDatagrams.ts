@@ -1,3 +1,4 @@
+import { observe, count, mediaBuffered } from "./performance"
 import { decodeAudio, decodeFrame, FrameFormat } from "@lwfa/proto"
 
 export const DATAGRAM_HEADER = 48
@@ -13,7 +14,7 @@ interface Header {
 }
 interface Assembly {
   header: Header; data: Uint8Array<ArrayBuffer>; seen: Uint8Array; received: number
-  created: number; complete: boolean
+  created: number; completed: number | null; complete: boolean
 }
 interface Lane { next: bigint | null; broken: boolean; last: bigint; activity: number; recovery: number }
 
@@ -56,16 +57,17 @@ export class MediaDatagrams {
         if (!oldest) return
         this.#drop(oldest, now, true)
       }
-      frame = { header: h, data: new Uint8Array(h.size), seen: new Uint8Array(h.count), received: 0, created: now, complete: false }
+      frame = { header: h, data: new Uint8Array(h.size), seen: new Uint8Array(h.count), received: 0, created: now, completed: null, complete: false }
       this.#frames.set(h.packet, frame)
       this.#bytes += h.size
+      mediaBuffered(this.#bytes)
     }
     const old = frame.header
     if (old.lane !== h.lane || old.frame !== h.frame || old.size !== h.size || old.count !== h.count || old.stride !== h.stride || old.key !== h.key || old.audio !== h.audio) {
       this.#drop(frame, now, true)
       return
     }
-    if (frame.seen[h.index]) return
+    if (frame.seen[h.index]) { count("duplicateFragments"); return }
     frame.seen[h.index] = 1
     frame.data.set(bytes.subarray(DATAGRAM_HEADER), h.index * h.stride)
     if (++frame.received !== h.count) return
@@ -74,6 +76,8 @@ export class MediaDatagrams {
       return
     }
     frame.complete = true
+    frame.completed = now
+    observe("reassembly", now - frame.created)
     this.acknowledge(h.packet)
     // Cross-check routing/recovery metadata against the actual codec packet.
     const video = h.audio ? null : decodeFrame(frame.data.buffer)
@@ -119,12 +123,13 @@ export class MediaDatagrams {
     }
   }
 
-  clear(): void { this.#frames.clear(); this.#lanes.clear(); this.#retired.clear(); this.#lastSweep = -Infinity; this.#allowed = null; this.#bytes = 0 }
+  clear(): void { this.#frames.clear(); this.#lanes.clear(); this.#retired.clear(); this.#lastSweep = -Infinity; this.#allowed = null; this.#bytes = 0; mediaBuffered(0) }
   get bufferedBytes(): number { return this.#bytes }
 
   #request(id: bigint, lane: Lane, now: number): void {
     if (id === 0n || now - lane.recovery < 500) return
     lane.recovery = now
+    count("recoveries")
     this.recover(id)
   }
   #forget(id: bigint, now: number): void {
@@ -134,12 +139,15 @@ export class MediaDatagrams {
   #remove(frame: Assembly): void {
     if (this.#frames.delete(frame.header.packet)) {
       this.#bytes -= frame.header.size
+      mediaBuffered(this.#bytes)
       this.#retired.add(frame.header.packet)
       if (this.#retired.size > 256) this.#retired.delete(this.#retired.values().next().value!)
     }
   }
   #drop(frame: Assembly, now: number, loss: boolean): void {
     if (!this.#frames.has(frame.header.packet)) return
+    if (!frame.complete && loss) count("incompleteFrames")
+    else if (!loss && !frame.header.audio) count("dependencyDrops")
     this.#remove(frame)
     if (!frame.complete) this.acknowledge(frame.header.packet) // release telemetry budget, not a delivery guarantee
     const h = frame.header
@@ -163,6 +171,7 @@ export class MediaDatagrams {
     for (const pending of [...this.#frames.values()]) {
       if (pending.header.lane === frame.header.lane && pending.header.frame <= lane.last) this.#drop(pending, now, false)
     }
+    if (frame.completed !== null) observe("reorder", now - frame.completed)
     this.deliver(frame.data.buffer)
   }
   #drain(id: bigint, lane: Lane, now: number): void {

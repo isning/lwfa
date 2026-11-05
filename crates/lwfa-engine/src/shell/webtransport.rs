@@ -298,9 +298,12 @@ async fn run(
                     )
                     .await??;
                 }
-                Outgoing::Frame(_, _) | Outgoing::Audio(_) => {
+                Outgoing::Frame(_, _, _) | Outgoing::Audio(_) => {
                     let (bytes, audio, frame) = match message {
-                        Outgoing::Frame(b, n) => (b, false, n),
+                        Outgoing::Frame(b, n, queued_at) => {
+                            if let Some(at) = queued_at { crate::telemetry::observe("sendQueue", at.elapsed()); }
+                            (b, false, n)
+                        },
                         Outgoing::Audio(b) => (b, true, 0),
                         _ => unreachable!(),
                     };
@@ -355,6 +358,7 @@ async fn run(
             result = tasks.join_next(), if !tasks.is_empty() => {
                 let (packet, sent) = result.ok_or_else(|| io::Error::other("media task missing"))??;
                 if sent.is_err() {
+                    crate::telemetry::count("sendExpired");
                     // Congestion/deadline expiry drops media, never the session.
                     if let Some(pending) = acks.lock().map_err(|_| io::Error::other("receipt lock"))?.remove(&packet) {
                         if !pending.audio { recover(&recovery, &events, id, pending.window); }
@@ -365,6 +369,7 @@ async fn run(
             _ = tick.tick() => {
                 if last_probe.elapsed() >= PROBE_INTERVAL {
                     last_probe = Instant::now();
+                    crate::telemetry::rtt(id, connection.rtt());
                     let queue = delay.observe(connection.rtt(), Instant::now());
                     slot.rtt_excess.store(queue.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
                     over_limit = if queue >= crate::bitrate::QUEUE_DELAY_LIMIT { over_limit + 1 } else { 0 };
@@ -375,6 +380,7 @@ async fn run(
                 let expired: Vec<_> = pending.iter().filter(|(_, p)| p.since.elapsed() >= datagrams::RECEIPT_TIMEOUT).map(|(&n, _)| n).collect();
                 for n in expired {
                     if let Some(p) = pending.remove(&n) {
+                        crate::telemetry::count("receiptTimeouts");
                         if !p.audio { recover(&recovery, &events, id, p.window); }
                         retire(&slot, p);
                     }
@@ -407,7 +413,7 @@ async fn read_control(
                         .map_err(|_| io::Error::other("recovery lock"))?
                         .streams = Some(message.clone());
                 }
-                events.send(ShellEvent::Message(slot.id, message))?;
+                events.send(incoming_message(slot.id, message))?;
             }
             1 if body.len() == 8 => {
                 let sequence = u64::from_be_bytes(body.try_into()?);

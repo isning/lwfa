@@ -306,7 +306,7 @@ pub fn serve_capabilities(mut stream: TcpStream) {
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let Some(head) = read_head(&mut stream) else { return; };
     let Some((method, _)) = request_line(&head) else { return; };
-    let mut capabilities = serde_json::json!({"codecs": ["hevcHdr", "hevc", "h264"], "pointerAxisSource": true});
+    let mut capabilities = serde_json::json!({"codecs": ["hevcHdr", "hevc", "h264"], "pointerAxisSource": true, "performanceStats": 1});
     if let Some(transport) = crate::shell::webtransport::discovery() {
         capabilities["webtransport"] = transport.clone();
     }

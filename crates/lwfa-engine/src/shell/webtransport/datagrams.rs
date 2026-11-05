@@ -21,6 +21,7 @@ pub struct Media {
 /// send_datagram_wait prevents us destroying large keyframes in our own queue.
 /// The HTTP/3 quarter-stream ID is included exactly as wtransport's sender does.
 pub async fn send(connection: Connection, media: Media) -> Result<(), Failure> {
+    let _send_timing = crate::telemetry::Span::new(if media.audio { "audioSend" } else { "datagramSend" });
     let max = connection
         .max_datagram_size()
         .ok_or_else(|| io::Error::other("peer has no datagrams"))?

@@ -1,3 +1,4 @@
+import { performanceStats, observe } from "./performance"
 /**
  * Turning Opus packets into audio the player can take.
  *
@@ -88,6 +89,7 @@ export class OpusStream {
   #timestamp = 0
   #failed = false
   #closed = false
+  #timings=new Map<number,number>()
 
   constructor(sink: PlanarSink, makeWasm?: () => WasmOpus | Promise<WasmOpus>) {
     this.#sink = sink
@@ -106,6 +108,10 @@ export class OpusStream {
     if (!this.#started) this.#ensure()
 
     if (this.#native) {
+      if(performanceStats.enabled) {
+        if(this.#timings.size>=128)this.#timings.delete(this.#timings.keys().next().value!)
+        this.#timings.set(this.#timestamp,performance.now())
+      }
       try {
         this.#native.decode(
           new EncodedAudioChunk({
@@ -145,6 +151,7 @@ export class OpusStream {
       // Already closed, or never opened.
     }
     this.#native = null
+    this.#timings.clear()
     this.#wasm?.free()
     this.#wasm = null
     this.#wasmReady = false
@@ -220,7 +227,9 @@ export class OpusStream {
     const wasm = this.#wasm
     if (!wasm) return
     try {
+      const started=performanceStats.enabled?performance.now():null
       const { channelData, samplesDecoded } = wasm.decodeFrame(packet)
+      if(started!==null)observe("audioDecode",performance.now()-started)
       if (samplesDecoded <= 0 || channelData.length === 0) return
       const left = channelData[0]!
       // `forceStereo` makes two channels the normal case; a mono plane is
@@ -236,6 +245,9 @@ export class OpusStream {
   #emit(data: AudioData): void {
     try {
       if (this.#closed) return
+      const started=this.#timings.get(data.timestamp)
+      this.#timings.delete(data.timestamp)
+      if(started!==undefined)observe("audioDecode",performance.now()-started)
       const frames = data.numberOfFrames
       if (frames === 0) return
       const left = new Float32Array(frames)

@@ -216,6 +216,7 @@ pub fn start(
                 // Whole chunks only. A short read mid-frame would shift every
                 // subsequent sample by a byte and turn the stream into noise
                 // permanently, so this fills the buffer or gives up.
+                let read_started = crate::telemetry::now();
                 match stdout.read_exact(&mut buffer) {
                     Ok(()) => {}
                     Err(err) => {
@@ -225,6 +226,7 @@ pub fn start(
                         return;
                     }
                 }
+                if let Some(at) = read_started { crate::telemetry::observe("audioCaptureWait", at.elapsed()); }
                 // Each encoding is built exactly when some listener needs it,
                 // and both can be needed at once: the fan-out sends every
                 // client the one it can decode. See `Chunk`.
@@ -347,6 +349,7 @@ impl Opus {
     /// Encode one 20ms frame. `None` means the caller should send raw PCM.
     fn encode(&mut self, samples: &[i16], out: &mut [u8]) -> Option<usize> {
         let encoder = self.encoder.as_mut()?;
+        let _encode_timing = crate::telemetry::Span::new("audioEncode");
         match encoder.encode(samples, out) {
             Ok(len) if len > 0 => Some(len),
             Ok(_) => None,

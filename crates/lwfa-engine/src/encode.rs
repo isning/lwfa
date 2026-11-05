@@ -395,6 +395,8 @@ impl Session {
         gop: u32,
         bitrate: u32,
     ) -> Result<Self, ff::Error> {
+        let _session_timing = crate::telemetry::Span::new("encoderOpen");
+        crate::telemetry::count("encoderOpens");
         let (width, height) = (frame.width, frame.height);
         let wanted = codec;
         let codec = ff::encoder::find_by_name(encoder_name(codec)).ok_or(ff::Error::EncoderNotFound)?;
@@ -1236,6 +1238,7 @@ mod admission_tests {
 struct Job {
     frame: CapturedFrame,
     ticket: u64,
+    queued_at: Option<std::time::Instant>,
 }
 
 enum Control {
@@ -1364,19 +1367,24 @@ impl EncodeWorker {
                     // collected with a frame apply before encoding that frame.
                     controls.apply(&mut encoders);
                     let Some(mut job) = job else { continue; };
+                    if let Some(at) = job.queued_at { crate::telemetry::observe("encoderQueue", at.elapsed()); }
 
                     // A frame for a window that was just forgotten is stale;
                     // encoding it would rebuild the session it just dropped.
                     if worker_admission.lock().is_ok_and(|admission| !admission.current(job.frame.id, job.ticket)) {
                         continue;
                     }
+                    let encode_started = crate::telemetry::now();
                     let Some(encoded) = encoders.encode(&mut job.frame) else {
+                        crate::telemetry::count("encodeFailures");
                         if let Ok(mut admission) = worker_admission.lock() {
                             admission.finish(job.frame.id, job.ticket, None, std::time::Instant::now());
                         }
                         continue;
                     };
 
+                    if let Some(at) = encode_started { crate::telemetry::observe("encode", at.elapsed()); }
+                    crate::telemetry::count("encodedFrames");
                     let header = lwfa_proto::FrameHeader {
                         window: job.frame.id,
                         width: job.frame.width,
@@ -1418,7 +1426,7 @@ impl EncodeWorker {
             }
             Err(_) => 0,
         };
-        if self.work.submit(Job { frame, ticket }) {
+        if self.work.submit(Job { frame, ticket, queued_at: crate::telemetry::now() }) {
             true
         } else {
             if let Ok(mut admission) = self.admission.lock() {

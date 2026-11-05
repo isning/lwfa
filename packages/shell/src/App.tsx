@@ -1,3 +1,4 @@
+import { recordPerformance } from "@/lib/performanceRuntime"
 import { randomId } from "./lib/randomId";
 import { HDR_CHANGED } from "@/lib/hdr";
 /**
@@ -1145,6 +1146,14 @@ export function App(): React.ReactElement {
       decoderRef.current = null;
     };
   }, [password, push, update, restoreCodecs]);
+
+  useEffect(() => {
+    if (!streamPrefs.diagnostics) return
+    return recordPerformance()
+  }, [streamPrefs.diagnostics])
+  useEffect(() => {
+    void connection.current?.setDiagnostics(streamPrefs.diagnostics && status === "connected")
+  }, [streamPrefs.diagnostics, status])
 
   // Keyboard input is captured on the document rather than per element,
   // because keyboard focus lives in the compositor and there is nothing

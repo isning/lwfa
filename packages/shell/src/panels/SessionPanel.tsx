@@ -1,3 +1,4 @@
+import { PerformancePanel } from "@/panels/PerformancePanel"
 import { usePresentations } from "@/lib/presentation"
 /**
  * What the session is actually doing.
@@ -141,6 +142,8 @@ function SessionPanel() {
           </>
         )}
       </PanelSection>
+
+      <PerformancePanel />
 
       {/* Moved here whole from Settings > Stream, where the switches are. */}
       <PanelSection title="Sound">

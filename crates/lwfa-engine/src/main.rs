@@ -27,6 +27,7 @@ mod hostbus;
 mod hostclip;
 mod cuda;
 mod encode;
+mod telemetry;
 mod focus;
 mod bitrate;
 mod gamepad;
@@ -750,6 +751,10 @@ fn handle_shell_event(state: &mut Lwfa, event: ShellEvent) {
     // which is the fork in the road between a socket problem and a handler bug.
     tracing::debug!("shell event: {event:?}");
     match event {
+        ShellEvent::TimedMessage(session, message, queued_at) => {
+            telemetry::observe("controlQueue", queued_at.elapsed());
+            handle_shell_event(state, ShellEvent::Message(session, message));
+        },
         ShellEvent::Connected {
             session,
             permissions,
@@ -1099,7 +1104,7 @@ fn allowed(who: &state::Session, is_primary: bool, message: &ToEngine) -> bool {
         // socket is real exactly as much as anyone else does. Reporting your
         // own crash is the same: it changes nothing on the machine, and a
         // view-only session's shell breaks in exactly the same ways.
-        ToEngine::Ping | ToEngine::Crashed { .. } => true,
+        ToEngine::Ping | ToEngine::PerformanceProbe { .. } | ToEngine::Crashed { .. } => true,
 
         ToEngine::SetLayout { .. } | ToEngine::SetViewport { .. } => is_primary,
 
@@ -1168,6 +1173,7 @@ fn kind_of(message: &ToEngine) -> &'static str {
 }
 
 fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, message: ToEngine) {
+    let _input_timing = matches!(&message, ToEngine::PointerMotion { .. } | ToEngine::PointerButton { .. } | ToEngine::PointerAxis { .. } | ToEngine::Key { .. } | ToEngine::TouchDown { .. } | ToEngine::TouchMotion { .. } | ToEngine::TouchUp { .. } | ToEngine::PointerLeave | ToEngine::SetGamepad { .. } | ToEngine::GamepadButton { .. } | ToEngine::GamepadAxis { .. }).then(|| telemetry::Span::new("inputDispatch"));
     match message {
         ToEngine::Gaming { request, action, component, appid, profile } => gaming::request(state, session, request, action,
             serde_json::json!({"action": action, "component": component, "appid": appid, "profile": profile})),
@@ -1265,6 +1271,11 @@ fn handle_shell_message(state: &mut Lwfa, session: lwfa_proto::SessionId, messag
             }
         }
 
+        ToEngine::PerformanceProbe { nonce } => {
+            if let Some((stages, counters, transport_rtt_ms)) = telemetry::snapshot(session) {
+                state.send_to_session(session, ToShell::Performance { nonce, stages, counters, transport_rtt_ms });
+            }
+        }
         ToEngine::Ping => {
             // Answered to the asking session only, straight away. The shell
             // uses the round trip to tell a live socket from the corpse iOS

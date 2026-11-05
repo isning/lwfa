@@ -117,3 +117,8 @@ it.each([undefined, "invalid", null, "auto", "video", "canvas"])("hydrates prese
   const { getPrefs } = await import("../src/lib/prefs")
   expect(getPrefs().stream.presentation).toBe(["auto", "video", "canvas"].includes(value as string) ? value : "auto")
 })
+
+it.each([undefined, null, "true", "false", false, true])("requires explicit boolean opt-in for diagnostics (%s)", async diagnostics => {
+  const prefs=await hydrateWith({stream:{diagnostics}})
+  expect(prefs.stream.diagnostics).toBe(diagnostics===true)
+})

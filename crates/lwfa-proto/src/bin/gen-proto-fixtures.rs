@@ -274,6 +274,7 @@ fn samples() -> (Vec<(&'static str, ToShell)>, Vec<(&'static str, ToEngine)>) {
             },
         ));
         v.push(("pong", ToShell::Pong));
+        v.push(("performance", ToShell::Performance { nonce: 7, stages: vec![PerformanceStage { name: "encode".into(), samples: 3, p50: 2.0, p95: 4.0, max: 4.0 }], counters: vec![PerformanceCounter { name: "encoderOpens".into(), value: 2 }], transport_rtt_ms: Some(12.5) }));
         v.push((
             "file-chooser",
             ToShell::FileChooser {
@@ -682,6 +683,7 @@ fn samples() -> (Vec<(&'static str, ToShell)>, Vec<(&'static str, ToEngine)>) {
     to_engine.push(("clip-drop", ToEngine::ClipDrop { id: 40 }));
     to_engine.push(("clip-clear", ToEngine::ClipClear));
     to_engine.push(("ping", ToEngine::Ping));
+    to_engine.push(("performance-probe", ToEngine::PerformanceProbe { nonce: 7 }));
 
     (to_shell, to_engine)
 }

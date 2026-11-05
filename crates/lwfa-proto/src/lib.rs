@@ -240,10 +240,21 @@ pub enum ClipOrigin {
     Device,
 }
 
+/// Local monotonic stage duration distribution in milliseconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceStage { pub name: String, pub samples: u32, pub p50: f64, pub p95: f64, pub max: f64 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceCounter { pub name: String, pub value: u64 }
+
 /// Engine to shell.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ToShell {
+    /// Requested only after capability discovery; old clients never receive it.
+    #[serde(rename_all = "camelCase")]
+    Performance { nonce: u32, stages: Vec<PerformanceStage>, counters: Vec<PerformanceCounter>, transport_rtt_ms: Option<f64> },
     /// Completion of an owner-only gaming component operation.
     Gaming { request: u32, data: serde_json::Value, error: Option<String> },
     /// First message on every connection. The shell should check
@@ -1015,6 +1026,8 @@ pub enum PointerAxisSource { Wheel, Continuous }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ToEngine {
+    /// Opt-in diagnostic probe. Recording expires five seconds after the last probe.
+    PerformanceProbe { nonce: u32 },
     /// Manage installed gaming components without blocking rendering.
     Gaming {
         request: u32,

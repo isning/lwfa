@@ -1,4 +1,5 @@
 /// <reference types="@webgpu/types" />
+import { inheritTiming, renderStarted, renderFinished } from "./performance"
 import { HDR_SHADER } from "./hdr-shader"
 import { HdrPlanes } from "./hdr-planes"
 import { log } from "./log"
@@ -20,7 +21,8 @@ export interface NativeVideoFrame {
   close(): void
 }
 export function nativeVideoFrame(video: VideoFrame): NativeVideoFrame {
-  return { native: true, get width() { return video.displayWidth }, get height() { return video.displayHeight }, video, close: () => video.close() }
+  const frame:NativeVideoFrame = { native: true, get width() { return video.displayWidth }, get height() { return video.displayHeight }, video, close: () => video.close() }
+  inheritTiming(video,frame);return frame
 }
 export type DrawableFrame = ImageBitmap | HdrFrame | NativeVideoFrame
 export const HDR_CHANGED = "lwfa-hdr-capability-changed"
@@ -168,6 +170,7 @@ async function preparePlanes(): Promise<void> {
 
 function render(video: VideoFrame, view: GPUTextureView): void {
   if (!device || !pipeline || !sampler) throw new Error("HDR device unavailable")
+  const renderStart=renderStarted(video)
   const image = device.importExternalTexture({ source: video, colorSpace: "srgb" })
   const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: image }, { binding: 1, resource: sampler }] })
   const encoder = device.createCommandEncoder()
@@ -177,6 +180,7 @@ function render(video: VideoFrame, view: GPUTextureView): void {
   pass.draw(3)
   pass.end()
   device.queue.submit([encoder.finish()])
+  renderFinished(video,renderStart)
 }
 
 /** Validate the actual external-texture conversion, not just canvas allocation.
@@ -216,7 +220,8 @@ export function hdrPresentationPath(): "external" | "planes" | null {
 }
 
 export function hdrFrame(video: VideoFrame): HdrFrame {
-  return { hdr: true, get width() { return video.displayWidth }, get height() { return video.displayHeight }, video, close: () => video.close() }
+  const frame:HdrFrame = { hdr: true, get width() { return video.displayWidth }, get height() { return video.displayHeight }, video, close: () => video.close() }
+  inheritTiming(video,frame);return frame
 }
 
 /** lib.dom currently omits the standard linear transfer enum.

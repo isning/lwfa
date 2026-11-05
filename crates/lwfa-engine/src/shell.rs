@@ -105,6 +105,7 @@ const GOODBYE_TIMEOUT: Duration = Duration::from_millis(250);
 /// could not be checked against anything.
 #[derive(Debug)]
 pub enum ShellEvent {
+    TimedMessage(SessionId, ToEngine, std::time::Instant),
     /// A shell connected. The engine replies with `Hello`.
     ///
     /// Carries who it turned out to be, because authentication happens on the
@@ -139,6 +140,13 @@ pub enum ShellEvent {
     Clip(crate::clipboard::Capture),
 }
 
+pub(super) fn incoming_message(session: SessionId, message: ToEngine) -> ShellEvent {
+    match crate::telemetry::now() {
+        Some(at) => ShellEvent::TimedMessage(session, message, at),
+        None => ShellEvent::Message(session, message),
+    }
+}
+
 /// Something queued for the shell: a control message or a frame of pixels.
 enum Outgoing {
     /// Serialized once by whoever queues it; a broadcast to five devices
@@ -146,7 +154,7 @@ enum Outgoing {
     Control(tungstenite::Utf8Bytes),
     /// An encoded video frame, header included. `Bytes`, so the fan-out
     /// to several watching devices clones a reference count, not megabytes.
-    Frame(tungstenite::Bytes, u64),
+    Frame(tungstenite::Bytes, u64, Option<std::time::Instant>),
     /// A chunk of audio. Separate from [`Outgoing::Frame`] because the two
     /// are accounted separately; see [`Slot::audio_in_flight`].
     Audio(tungstenite::Bytes),
@@ -375,6 +383,7 @@ impl Clients {
     }
 
     fn remove(&self, id: SessionId) {
+        crate::telemetry::forget(id);
         if let Ok(mut slots) = self.slots.lock() {
             slots.retain(|slot| slot.id != id);
         }
@@ -651,9 +660,6 @@ impl FrameSink {
             // A rendition may finish after a new SDR viewer subscribes. Never
             // fan an in-flight HDR frame out to a viewer that did not opt in.
             if bytes.get(5) == Some(&(lwfa_proto::FrameFormat::HevcHdr as u8)) && !slot.hdr.load(Ordering::Relaxed) { continue; }
-            if !slot.has_room(max, max_bytes) {
-                continue;
-            }
             let wanted = slot
                 .streams
                 .lock()
@@ -662,9 +668,13 @@ impl FrameSink {
             if !wanted {
                 continue;
             }
+            if !slot.has_room(max, max_bytes) {
+                crate::telemetry::count("sendBackpressure");
+                continue;
+            }
             slot.in_flight.fetch_add(1, Ordering::Relaxed);
             slot.in_flight_bytes.fetch_add(size, Ordering::Relaxed);
-            if slot.outgoing.send(Outgoing::Frame(bytes.clone(), sequence)).is_err() {
+            if slot.outgoing.send(Outgoing::Frame(bytes.clone(), sequence, crate::telemetry::now())).is_err() {
                 slot.in_flight.fetch_sub(1, Ordering::Relaxed);
                 slot.in_flight_bytes.fetch_sub(size, Ordering::Relaxed);
             }
@@ -820,6 +830,7 @@ struct Live {
     /// this used to, meant a slow link could buffer *seconds* of video inside
     /// the socket with the engine convinced everything was fine.
     unacked_video: usize,
+    unacked_since: Option<std::time::Instant>,
     /// The same frames measured in bytes. See [`Slot::in_flight_bytes`].
     unacked_bytes: usize,
     /// Audio chunks in the same position.
@@ -1259,6 +1270,7 @@ fn accept_loop(
                         answering,
                         last_pong: None,
                         unacked_video: 0,
+                        unacked_since: None,
                         unacked_bytes: 0,
                         unacked_audio: 0,
                         last_read: std::time::Instant::now(),
@@ -1676,7 +1688,7 @@ fn pump(client: &mut Live, events: &LoopSender<ShellEvent>) -> bool {
                 match serde_json::from_str::<ToEngine>(&text) {
                     Ok(message) => {
                         if events
-                            .send(ShellEvent::Message(client.id, message))
+                            .send(incoming_message(client.id, message))
                             .is_err()
                         {
                             return false;
@@ -1704,6 +1716,7 @@ fn pump(client: &mut Live, events: &LoopSender<ShellEvent>) -> bool {
                     client.last_pong = Some(now);
                     client.answering.store(true, Ordering::Relaxed);
                     let rtt = now.duration_since(sent);
+                    crate::telemetry::rtt(client.id, rtt);
                     let excess = client.delay.observe(rtt, now);
                     client
                         .rtt_excess
@@ -1769,7 +1782,9 @@ fn pump(client: &mut Live, events: &LoopSender<ShellEvent>) -> bool {
                 // delivery. See `Live::unacked_video`.
                 let frame = match outbound {
                     Outgoing::Control(json) => tungstenite::Message::Text(json),
-                    Outgoing::Frame(bytes, _) => {
+                    Outgoing::Frame(bytes, _, queued_at) => {
+                        if let Some(at) = queued_at { crate::telemetry::observe("sendQueue", at.elapsed()); }
+                        if client.unacked_since.is_none() { client.unacked_since = crate::telemetry::now(); }
                         client.unacked_video += 1;
                         client.unacked_bytes += bytes.len();
                         tungstenite::Message::Binary(bytes)
@@ -1802,6 +1817,7 @@ fn pump(client: &mut Live, events: &LoopSender<ShellEvent>) -> bool {
             // Everything the socket was holding has reached the kernel, so
             // every frame handed over so far is off this client's account.
             if client.unacked_video > 0 {
+                if let Some(at) = client.unacked_since.take() { crate::telemetry::observe("websocketFlush", at.elapsed()); }
                 client
                     .in_flight
                     .fetch_sub(client.unacked_video, Ordering::Relaxed);
@@ -2149,7 +2165,7 @@ pub(crate) mod tests {
         let bytes = lwfa_proto::FrameHeader { window: WindowId(1), width: 320, height: 240,
             format: lwfa_proto::FrameFormat::HevcHdr, keyframe: true }.encode_with_payload(&[1,2,3]);
         FrameSink { clients }.send_frame(WindowId(1),bytes);
-        assert!(matches!(hdr_rx.try_recv(),Ok(Outgoing::Frame(_, _))));
+        assert!(matches!(hdr_rx.try_recv(),Ok(Outgoing::Frame(_, _, _))));
         assert!(sdr_rx.try_recv().is_err());
     }
 
@@ -2163,11 +2179,11 @@ pub(crate) mod tests {
         let sink = FrameSink { clients };
         sink.send_frame(WindowId(1), vec![1]);
         sink.send_frame(WindowId(1), vec![2]); // dropped by the per-client budget
-        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 1))));
+        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 1, _))));
         slot.in_flight.store(0, Ordering::Relaxed);
         slot.in_flight_bytes.store(0, Ordering::Relaxed);
         sink.send_frame(WindowId(1), vec![3]);
-        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 3))));
+        assert!(matches!(incoming.try_recv(), Ok(Outgoing::Frame(_, 3, _))));
     }
 
     fn test_slot() -> Slot {

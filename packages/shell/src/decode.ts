@@ -1,3 +1,4 @@
+import { timing, decodeFinished, converted, count, type FrameTiming } from "@/lib/performance"
 import { getPrefs } from "@/lib/prefs"
 import { nativeVideoAvailable } from "@/lib/native-hdr"
 import { HDR_COLOR_SPACE, hdrFrame, nativeVideoFrame, type DrawableFrame } from "@/lib/hdr"
@@ -65,6 +66,7 @@ export class FrameDecoder {
   #supportChecks = new Map<WindowId, object>()
   #families = new Map<WindowId, Codec>()
   #decoders = new Map<WindowId, VideoDecoder>()
+  #timings = new Map<WindowId, Map<number, { trace:FrameTiming; started:number }>>()
   /** Windows still waiting for their first keyframe. */
   #awaitingKeyframe = new Set<WindowId>()
   /** Size each decoder was configured for, so a resize can reconfigure it. */
@@ -115,7 +117,10 @@ export class FrameDecoder {
     const deliver = this.#deliveryFor(id)
     const blob = new Blob([frame.payload as BlobPart], { type: "image/jpeg" })
     try {
-      deliver(await createImageBitmap(blob))
+      const started=performance.now(), trace=timing(frame)
+      const bitmap=await createImageBitmap(blob)
+      decodeFinished(bitmap,trace,started)
+      deliver(bitmap)
     } catch (err) {
       console.warn(`could not decode a JPEG frame for w${frame.header.window}:`, err)
     }
@@ -222,6 +227,9 @@ export class FrameDecoder {
               videoFrame.close()
               return
             }
+            const stamp=this.#timings.get(id)?.get(videoFrame.timestamp)
+            this.#timings.get(id)?.delete(videoFrame.timestamp)
+            if(stamp)decodeFinished(videoFrame,stamp.trace,stamp.started)
             const deliver = this.#deliveryFor(id)
             // Conversion copies the pixels asynchronously. Keep the VideoFrame
             // alive until it completes, then release its decoder buffer.
@@ -233,8 +241,9 @@ export class FrameDecoder {
               deliver(nativeVideoFrame(videoFrame))
               return
             }
+            const conversionStarted=performance.now()
             createImageBitmap(videoFrame)
-              .then(deliver)
+              .then(bitmap=>{converted(videoFrame,bitmap,conversionStarted);deliver(bitmap)})
               .catch((err) => console.warn(`could not convert a frame for w${id}:`, err))
               .finally(() => videoFrame.close())
           },
@@ -274,6 +283,12 @@ export class FrameDecoder {
     const timestamp = (this.#timestamps.get(id) ?? 0) + 16_667
     this.#timestamps.set(id, timestamp)
 
+    const trace=timing(frame)
+    if(trace) {
+      const pending=this.#timings.get(id)??new Map()
+      if(pending.size>=64)pending.delete(pending.keys().next().value!)
+      pending.set(timestamp,{trace,started:performance.now()});this.#timings.set(id,pending)
+    }
     try {
       decoder.decode(
         new EncodedVideoChunk({
@@ -342,6 +357,7 @@ export class FrameDecoder {
     if (this.#failed.has(family)) return
     this.#failed.add(family)
     console.warn(`w${id}: ${family} failed; requesting another stream format:`, reason)
+    count("decodeFailures")
     const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
     const size = config ? ` ${config.width}×${config.height}` : ""
     this.#onUnsupported(family, `Window ${id}${size}: ${message}`)
@@ -373,6 +389,7 @@ export class FrameDecoder {
   }
 
   #reset(id: WindowId, preserveRecovery = false): void {
+    this.#timings.delete(id)
     if (!preserveRecovery) this.#recovery.delete(id)
     this.#supportChecks.delete(id)
     this.#families.delete(id)

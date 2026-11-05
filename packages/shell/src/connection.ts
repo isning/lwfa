@@ -1,3 +1,4 @@
+import { performanceStats, frameReceived, resetFrameTimings, count } from "./lib/performance"
 import { sessionSocket, type SessionSocket } from "./lib/transport"
 import { log } from "./lib/log"
 /**
@@ -125,6 +126,10 @@ export class Connection {
   #retryMs = RECONNECT_MIN_MS
   #timer: ReturnType<typeof setTimeout> | null = null
   #closed = false
+  #performanceTimer: ReturnType<typeof setInterval> | null = null
+  #performanceGeneration = 0
+  #performanceNonce = 0
+  #performanceSent = new Map<number, number>()
   /** The deadline on an unanswered resume probe. See `#onResume`. */
   #probe: ReturnType<typeof setTimeout> | null = null
   /** The repeating check for a socket that has gone quiet. See `#watch`. */
@@ -290,6 +295,7 @@ export class Connection {
           console.warn("dropping an undecodable binary frame")
           return
         }
+        frameReceived(frame)
         this.#handlers.onFrame(frame)
         return
       }
@@ -315,7 +321,18 @@ export class Connection {
         return
       }
 
+      if (message.type === "performance") {
+        const sent = this.#performanceSent.get(message.nonce)
+        if (sent !== undefined) {
+          this.#performanceSent.delete(message.nonce)
+          const now = performance.now()
+          performanceStats.server(message, now, now - sent)
+        }
+        return
+      }
       if (message.type === "hello") {
+        performanceStats.reconnect()
+        resetFrameTimings()
         this.#everGreeted = true
         this.#handlers.onStatus("connected", socket.transport === "webtransport" ? (socket.media === "datagram" ? "WebTransport (QUIC datagrams)" : "WebTransport (QUIC streams)") : "WebSocket (TCP)")
       }
@@ -336,6 +353,8 @@ export class Connection {
       if (socket !== this.#socket) return
 
       this.#socket = null
+      void this.setDiagnostics(false)
+      resetFrameTimings()
       if (this.#closed) return
 
       if (event.reason === SUPERSEDED_REASON) {
@@ -442,8 +461,47 @@ export class Connection {
     this.#socket.send(encode(message))
   }
 
+  async setDiagnostics(enabled: boolean): Promise<void> {
+    const generation = ++this.#performanceGeneration
+    if (this.#performanceTimer !== null) clearInterval(this.#performanceTimer)
+    this.#performanceTimer = null
+    this.#performanceSent.clear()
+    if (!enabled || this.#closed) return
+    performanceStats.status("checking")
+    const socket = this.#socket
+    try {
+      const url = new URL(this.#url)
+      url.protocol = url.protocol === "wss:" ? "https:" : "http:"
+      url.pathname = url.pathname.replace(/\/$/, "") + "/capabilities.json"
+      url.search = ""
+      const response = await fetch(url, { credentials: "omit", cache: "no-store", signal: AbortSignal.timeout(3000) })
+      const body: unknown = await response.json()
+      if (generation !== this.#performanceGeneration || this.#closed || this.#socket !== socket) return
+      if (!response.ok || typeof body !== "object" || !body || !("performanceStats" in body) || body.performanceStats !== 1) {
+        performanceStats.status("unsupported"); return
+      }
+      const probe = () => {
+        if (this.#socket?.readyState !== WebSocket.OPEN) return
+        if (this.#performanceSent.size >= 4) {
+          this.#performanceSent.delete(this.#performanceSent.keys().next().value!)
+          count("probeTimeouts")
+        }
+        const nonce = this.#performanceNonce = (this.#performanceNonce + 1) >>> 0
+        this.#performanceSent.set(nonce, performance.now())
+        this.send({ type: "performanceProbe", nonce })
+      }
+      performanceStats.status("waiting")
+      probe()
+      this.#performanceTimer = setInterval(probe, 1000)
+    } catch {
+      if (generation === this.#performanceGeneration && !this.#closed) performanceStats.status("unsupported")
+    }
+  }
+
   close(): void {
     this.#closed = true
+    void this.setDiagnostics(false)
+    resetFrameTimings()
     if (this.#timer !== null) clearTimeout(this.#timer)
     if (this.#watchdog !== null) {
       clearInterval(this.#watchdog)

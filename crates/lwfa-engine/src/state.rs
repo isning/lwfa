@@ -2085,13 +2085,15 @@ impl Lwfa {
 
             let overlays = self.overlays_for(&window, loc);
             let gpu_direct = self.config.stream.gpu_direct;
-            let Some(frame) =
-                self.capture
-                    .capture(renderer, id, &window, size, density, &overlays, gpu_direct, worker.prefetch_capture(id))
-            else {
-                continue;
-            };
-            self.capture_pacing.insert(id, now);
+            let capture_started = crate::telemetry::now();
+            let captured = self.capture
+                .capture(renderer, id, &window, size, density, &overlays, gpu_direct, worker.prefetch_capture(id));
+            if let Some(at) = capture_started { crate::telemetry::observe("capture", at.elapsed()); }
+            let Some(frame) = captured else { continue; };
+            crate::telemetry::count("capturedFrames");
+            if let Some(last) = self.capture_pacing.insert(id, now) {
+                crate::telemetry::observe("captureGap", now.saturating_duration_since(last));
+            }
 
             if let Some(t0) = t0 {
                 tracing::info!(
@@ -2115,6 +2117,7 @@ impl Lwfa {
                     // Should not happen: capacity was checked above and only
                     // this thread submits. Skip just this window rather than
                     // abandoning the rest of the pass.
+                    crate::telemetry::count("encoderDrops");
                     tracing::trace!("encoder busy, dropped a frame for {id}");
                     continue;
                 }

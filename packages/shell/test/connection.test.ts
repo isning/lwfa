@@ -301,3 +301,37 @@ describe("additive scroll source negotiation", () => {
     } finally { fetch.mockRestore() }
   })
 })
+
+describe("optional performance probes", () => {
+  it("never sends new protocol messages to an older engine", async () => {
+    const fetch=vi.spyOn(globalThis,"fetch").mockResolvedValue(Response.json({codecs:["h264"]}))
+    const conn=new Connection("ws://engine/engine?token=private",handlers());conn.connect();opened[0]!.accept()
+    try {
+      await conn.setDiagnostics(true)
+      expect(opened[0]!.sent.map(s=>JSON.parse(s).type)).not.toContain("performanceProbe")
+      expect(String(fetch.mock.calls[0]![0])).toBe("http://engine/engine/capabilities.json")
+    } finally {conn.close();fetch.mockRestore()}
+  })
+  it("probes once per second and stops on disable", async () => {
+    const fetch=vi.spyOn(globalThis,"fetch").mockResolvedValue(Response.json({performanceStats:1}))
+    const conn=new Connection("ws://engine",handlers());conn.connect();opened[0]!.accept()
+    try {
+      await conn.setDiagnostics(true)
+      expect(opened[0]!.sent.map(s=>JSON.parse(s).type)).toContain("performanceProbe")
+      vi.advanceTimersByTime(1000)
+      expect(opened[0]!.sent.map(s=>JSON.parse(s).type).filter(t=>t==="performanceProbe")).toHaveLength(2)
+      await conn.setDiagnostics(false);vi.advanceTimersByTime(1000)
+      expect(opened[0]!.sent.map(s=>JSON.parse(s).type).filter(t=>t==="performanceProbe")).toHaveLength(2)
+    } finally {conn.close();fetch.mockRestore()}
+  })
+  it("does not start a late capability probe after recording was disabled", async () => {
+    let answer!:(response:Response)=>void
+    const fetch=vi.spyOn(globalThis,"fetch").mockImplementation(()=>new Promise(resolve=>{answer=resolve}))
+    const conn=new Connection("ws://engine",handlers());conn.connect();opened[0]!.accept()
+    try {
+      const pending=conn.setDiagnostics(true);await conn.setDiagnostics(false)
+      answer(Response.json({performanceStats:1}));await pending
+      expect(opened[0]!.sent.map(s=>JSON.parse(s).type)).not.toContain("performanceProbe")
+    } finally {conn.close();fetch.mockRestore()}
+  })
+})

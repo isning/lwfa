@@ -155,6 +155,7 @@ not own a display outright.
 | [Remote access](docs/remote-access.md) | Another device, TLS, reverse proxies, the iPad home screen |
 | [The shell](docs/shell.md) | Navigation rail, on-screen keyboard and gamepad, audio, clipboard |
 | [Streaming](docs/streaming.md) | Codecs, zero-copy capture, how the bitrate follows the network |
+| [Performance](docs/performance.md) | Stage timings, trend charts, playback and transport counters, diagnostic export |
 | [Playing games](docs/gaming.md) | Steam, Proton, the virtual controller, X11 by hand |
 | [Accounts](docs/accounts.md) | Shared password, named users, permissions |
 | [Architecture](docs/architecture.md) | The decisions and why. Read this before changing anything structural |

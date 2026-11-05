@@ -1,3 +1,4 @@
+import { performanceStats, observe, count, inheritTiming, renderStarted, renderFinished } from "./performance"
 import { log } from "./log"
 
 type VideoGenerator = MediaStreamTrack & { writable: WritableStream<VideoFrame> }
@@ -30,6 +31,10 @@ export class NativeHdrPresenter {
   #pending: Job | null = null
   #running = false
   #destroyed = false
+  #videoCallback: number | null = null
+  #lastPresented: number | null = null
+  #lastDropped = 0
+  #unsubscribe: () => void
 
   constructor(video: HTMLVideoElement, failed: (reason: string) => void) {
     const Generator = generatorConstructor()
@@ -44,6 +49,8 @@ export class NativeHdrPresenter {
     // first (and possibly only) frame; generators do not retain old frames.
     this.#ready = new Promise(resolve => setTimeout(resolve, 0))
     void video.play().catch(error => { if (!this.#destroyed) failed(`native video playback: ${String(error)}`) })
+    this.#unsubscribe=performanceStats.subscribe(()=>this.#watchPresentation())
+    this.#watchPresentation()
     log("info", "[presentation] native video presenter started")
   }
 
@@ -52,7 +59,9 @@ export class NativeHdrPresenter {
     // Rebase on arrival time: decoder timestamps advance only on submitted
     // frames, so idle applications otherwise leave playback far in the past.
     const frame = new VideoFrame(video, { timestamp: Math.round(performance.now() * 1000) })
+    inheritTiming(video,frame)
     return new Promise((resolve, reject) => {
+      if(this.#pending)count("nativeReplaced")
       this.#pending?.frame.close()
       this.#pending?.resolve()
       this.#pending = { frame, resolve, reject }
@@ -67,7 +76,11 @@ export class NativeHdrPresenter {
       this.#pending = null
       try {
         await this.#ready
-        if (!this.#destroyed) await this.#writer.write(job.frame)
+        if (!this.#destroyed) {
+          const started=renderStarted(job.frame)
+          await this.#writer.write(job.frame)
+          renderFinished(job.frame,started,true)
+        }
         job.resolve()
       } catch (error) { if (this.#destroyed) job.resolve(); else job.reject(error) }
       finally { job.frame.close() }
@@ -75,9 +88,30 @@ export class NativeHdrPresenter {
     this.#running = false
   }
 
+  #watchPresentation(): void {
+    if(!performanceStats.enabled||this.#destroyed) {
+      if(this.#videoCallback!==null)this.#video.cancelVideoFrameCallback?.(this.#videoCallback)
+      this.#videoCallback=null;this.#lastPresented=null
+      this.#lastDropped=this.#video.getVideoPlaybackQuality?.().droppedVideoFrames??0
+      return
+    }
+    if(this.#videoCallback!==null||typeof this.#video.requestVideoFrameCallback!=="function")return
+    this.#videoCallback=this.#video.requestVideoFrameCallback(now=>{
+      this.#videoCallback=null
+      if(this.#lastPresented!==null)observe("videoCallback",now-this.#lastPresented)
+      this.#lastPresented=now
+      const dropped=this.#video.getVideoPlaybackQuality?.().droppedVideoFrames??0
+      if(dropped>=this.#lastDropped)count("nativeDropped",dropped-this.#lastDropped)
+      this.#lastDropped=dropped
+      this.#watchPresentation()
+    })
+  }
+
   destroy(): void {
     if (this.#destroyed) return
     this.#destroyed = true
+    this.#unsubscribe()
+    this.#watchPresentation()
     this.#pending?.frame.close()
     this.#pending?.resolve()
     this.#pending = null

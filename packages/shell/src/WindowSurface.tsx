@@ -1,3 +1,4 @@
+import { renderStarted, renderFinished } from "@/lib/performance"
 import { choosePresentation, notePresentation, forgetPresentation } from "@/lib/presentation"
 import { drawHdr, disableHdr } from "@/lib/hdr"
 import { NativeHdrPresenter, nativeVideoAvailable } from "@/lib/native-hdr"
@@ -314,7 +315,9 @@ export const WindowSurface = memo(function WindowSurface({
     const ctx = ctx2d.current
     if (!ctx) return
     try {
+      const started=renderStarted(frame)
       ctx.drawImage("video" in frame ? frame.video : frame, 0, 0)
+      renderFinished(frame,started)
     } catch {
       // Belt and braces for the same race: the check above is the honest test,
       // but a bitmap closed *between* it and here would still throw, and no

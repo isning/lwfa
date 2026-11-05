@@ -1,4 +1,5 @@
 /// <reference types="@webgpu/types" />
+import { inheritTiming, renderStarted, renderFinished } from "./performance"
 import { HDR_SHADER } from "./hdr-shader"
 
 const shader = `${HDR_SHADER}
@@ -52,6 +53,7 @@ export class HdrPlanes {
     if (this.#destroyed) return Promise.reject(new Error("HDR plane uploader destroyed"))
     // Clone synchronously: callers may close the decoder frame immediately.
     const owned = video.clone()
+    inheritTiming(video,owned)
     return new Promise((resolve, reject) => {
       this.#pending?.video.close()
       this.#pending?.resolve()
@@ -67,6 +69,7 @@ export class HdrPlanes {
       this.#pending = null
       try {
         if (this.#destroyed || !job.active()) { job.resolve(); continue }
+        const renderStart=renderStarted(job.video)
         const format = String(job.video.format)
         if (format !== "I420P10") throw new Error(`HDR requires accessible 10-bit planes, got ${format}`)
         const rect = job.video.visibleRect
@@ -92,6 +95,7 @@ export class HdrPlanes {
         const pass = encoder.beginRenderPass({ colorAttachments: [{ view: job.view(), loadOp: "clear", storeOp: "store", clearValue: [0,0,0,1] }] })
         pass.setPipeline(this.#pipeline); pass.setBindGroup(0,group); pass.draw(3); pass.end()
         this.#device.queue.submit([encoder.finish()])
+        renderFinished(job.video,renderStart)
         job.resolve()
       } catch (error) { job.reject(error) }
       finally { job.video.close() }

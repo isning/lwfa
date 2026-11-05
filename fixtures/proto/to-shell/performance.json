@@ -1,0 +1,20 @@
+{
+  "type": "performance",
+  "nonce": 7,
+  "stages": [
+    {
+      "name": "encode",
+      "samples": 3,
+      "p50": 2.0,
+      "p95": 4.0,
+      "max": 4.0
+    }
+  ],
+  "counters": [
+    {
+      "name": "encoderOpens",
+      "value": 2
+    }
+  ],
+  "transportRttMs": 12.5
+}

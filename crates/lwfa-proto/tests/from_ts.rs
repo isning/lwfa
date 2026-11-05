@@ -240,6 +240,7 @@ fn expected_to_shell() -> Vec<(&'static str, ToShell)> {
             },
         ),
         ("pong", ToShell::Pong),
+        ("performance", ToShell::Performance { nonce: 7, stages: vec![PerformanceStage { name: "encode".into(), samples: 3, p50: 2.0, p95: 4.0, max: 4.0 }], counters: vec![PerformanceCounter { name: "encoderOpens".into(), value: 2 }], transport_rtt_ms: Some(12.5) }),
         (
             "already-running",
             ToShell::AlreadyRunning {
@@ -689,6 +690,7 @@ fn expected_to_engine() -> Vec<(&'static str, ToEngine)> {
         ("clip-drop", ToEngine::ClipDrop { id: 40 }),
         ("clip-clear", ToEngine::ClipClear),
         ("ping", ToEngine::Ping),
+        ("performance-probe", ToEngine::PerformanceProbe { nonce: 7 }),
     ]
 }
 
