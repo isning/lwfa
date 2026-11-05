@@ -47,7 +47,7 @@ persistent = false
 [clipboard]
 desktop = false
 [stream]
-gpu_direct = false
+gpu_direct = ${process.env.LWFA_TEST_GPU_DIRECT ? "true" : "false"}
 ${process.env.LWFA_TEST_HDR_FALLBACK ? "max_h264_sessions = 0" : ""}
 `)
 
@@ -118,10 +118,13 @@ async function verifyStream(connection, id, filename, expectedHdr = hdrOutput, c
   const path = join(directory, expectedHdr ? `${filename}.hevc` : filename)
   writeFileSync(path, frame.payload)
   if (expectedHdr) {
-    const probe = spawnSync(process.env.LWFA_TEST_FFPROBE ?? "ffprobe", ["-v", "error", "-show_streams", "-of", "json", path])
+    const probe = spawnSync(process.env.LWFA_TEST_FFPROBE ?? "ffprobe", ["-v", "error", "-show_streams", "-show_frames", "-of", "json", path])
     assert.equal(probe.status, 0, probe.stderr?.toString())
     const stream = JSON.parse(probe.stdout.toString()).streams[0]
     assert.equal(stream.profile, "Main 10")
+    const metadata = JSON.parse(probe.stdout.toString()).frames[0].side_data_list ?? []
+    assert(metadata.some((entry) => entry.side_data_type === "Mastering display metadata"), "HDR10 mastering SEI required")
+    assert(metadata.some((entry) => entry.side_data_type === "Content light level metadata"), "HDR10 content-light SEI required")
     assert.equal(stream.pix_fmt, "yuv420p10le")
     assert.equal(stream.color_primaries, "bt2020")
     assert.equal(stream.color_transfer, "smpte2084")
@@ -150,7 +153,7 @@ try {
   }
   const display = await until(() => readdirSync(env.XDG_RUNTIME_DIR).find((file) => /^wayland-\d+$/.test(file)), "Wayland socket")
   if (process.env.LWFA_TEST_COLOR) {
-    for (const invalid of ["mastering", "duplicate", "incomplete"]) {
+    for (const invalid of ["unsupported", "duplicate", "incomplete"]) {
       const probe = start("client", clientPath, { WAYLAND_DISPLAY: display, LWFA_TEST_COLOR_INVALID: invalid })
       await until(() => probe.exitCode !== null || probe.signalCode !== null, `protocol rejection: ${invalid}`)
       assert.equal(probe.exitCode, 0, `wrong protocol error for ${invalid}`)
@@ -181,7 +184,7 @@ try {
   const second = await connect(port)
   assert(second.hello.windows.some((candidate) => candidate.id === window.id), "reconnect must restore the same window")
   await verifyStream(second, window.id, "reconnected.jpg")
-  console.log(`PASS: no-host EGL, wl_shm, viewport, decoded ${hdrOutput ? "Main10/PQ" : "JPEG"} pixels, ${disconnectedMs}ms disconnect and same-window reconnect`)
+  console.log(`PASS: no-host EGL, ${logs.client.includes("DMA-BUF imported") ? "DMA-BUF" : "wl_shm"}, viewport, decoded ${hdrOutput ? "Main10/PQ" : "JPEG"} pixels, ${disconnectedMs}ms disconnect and same-window reconnect`)
 } finally {
   for (const socket of sockets) await close(socket).catch(() => {})
   for (const child of children.reverse()) {

@@ -15,6 +15,8 @@ static struct wp_color_manager_v1 *color_manager;
 static struct wp_image_description_v1 *color_image;
 static struct wp_color_management_surface_v1 *color_surface;
 static int color_ready;
+static const char *source_space;
+static int scrgb_source(void) { return source_space && !strcmp(source_space,"scrgb"); }
 static void ignored_uint(void *data, struct wp_color_manager_v1 *manager, uint32_t value) { (void)data; (void)manager; (void)value; }
 static void ignored_done(void *data, struct wp_color_manager_v1 *manager) { (void)data; (void)manager; }
 static const struct wp_color_manager_v1_listener color_listener = { .supported_intent = ignored_uint, .supported_feature = ignored_uint, .supported_tf_named = ignored_uint, .supported_primaries_named = ignored_uint, .done = ignored_done };
@@ -26,12 +28,17 @@ static const struct wp_image_description_v1_listener image_listener = { .ready =
 #define WIDTH 320
 #define HEIGHT 240
 
+#ifdef LWFA_DMA_TEST
+#include "headless-dmabuf.h"
+#endif
+
 struct buffer {
     struct wl_buffer *handle;
     uint32_t *pixels;
     int busy;
 };
 
+static struct wl_display *client_display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct xdg_wm_base *shell;
@@ -65,11 +72,25 @@ static void draw(void) {
         if (!buffers[i].busy) { buffer = &buffers[i]; break; }
     }
     if (!buffer) return;
+#ifdef LWFA_EXPLICIT_TEST
+    sync_prepare((unsigned)(buffer-buffers));
+#elif defined(LWFA_DMA_TEST)
+    dma_draw((unsigned)(buffer-buffers));
+#else
     for (unsigned y = 0; y < HEIGHT; ++y) {
         for (unsigned x = 0; x < WIDTH; ++x) {
+#ifdef LWFA_COLOR_TEST
+            if (scrgb_source()) {
+                uint16_t *pixel=(uint16_t *)buffer->pixels+(y*WIDTH+x)*4;
+                pixel[0]=pixel[1]=pixel[2]=0x3d00; /* half 1.25 = 100 cd/m² */
+                pixel[3]=0x3c00;
+                continue;
+            }
+#endif
             buffer->pixels[y * WIDTH + x] =
 #ifdef LWFA_COLOR_TEST
-                (3u << 30) | (520u << 20) | (520u << 10) | 520u; /* 10-bit PQ approximately 100 cd/m². */
+                source_space && !strcmp(source_space,"hlg") ? (3u<<30)|(644u<<20)|(644u<<10)|644u :
+                (3u << 30) | (520u << 20) | (520u << 10) | 520u; /* PQ approximately 100 cd/m². */
 #else
                 0xffcc3322;
 #endif
@@ -77,6 +98,7 @@ static void draw(void) {
     }
     /* Changing content proves frame callbacks keep the application advancing. */
     buffer->pixels[(frames % HEIGHT) * WIDTH] = 0xff22cc33;
+    #endif
     buffer->busy = 1;
     ready = 0;
     struct wl_callback *callback = wl_surface_frame(surface);
@@ -84,6 +106,10 @@ static void draw(void) {
     wl_surface_attach(surface, buffer->handle, 0, 0);
     wl_surface_damage(surface, 0, 0, WIDTH, HEIGHT);
     wl_surface_commit(surface);
+#ifdef LWFA_EXPLICIT_TEST
+    wl_display_flush(client_display);
+    sync_produce((unsigned)(buffer-buffers));
+#endif
     printf("frame %u\n", ++frames);
     fflush(stdout);
 }
@@ -122,6 +148,16 @@ static void global(void *data, struct wl_registry *registry, uint32_t name,
         wp_color_manager_v1_add_listener(color_manager, &color_listener, NULL);
     } else
 #endif
+#ifdef LWFA_DMA_TEST
+#ifdef LWFA_EXPLICIT_TEST
+    if (!strcmp(interface,"wp_linux_drm_syncobj_manager_v1")) {
+        sync_manager=wl_registry_bind(registry,name,&wp_linux_drm_syncobj_manager_v1_interface,1);
+    } else
+#endif
+    if (!strcmp(interface,"zwp_linux_dmabuf_v1")) {
+        dma_manager=wl_registry_bind(registry,name,&zwp_linux_dmabuf_v1_interface,3);
+    } else
+#endif
     if (!strcmp(interface, "wl_compositor")) {
         compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 1);
     } else if (!strcmp(interface, "wl_shm")) {
@@ -140,20 +176,36 @@ static const struct wl_registry_listener registry_listener = {
 
 int main(void) {
     struct wl_display *display = wl_display_connect(NULL);
+    client_display=display;
+#ifdef LWFA_COLOR_TEST
+    source_space=getenv("LWFA_TEST_SOURCE_SPACE");
+#endif
     if (!display) return 1;
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     if (wl_display_roundtrip(display) < 0 || !compositor || !shm || !shell) return 2;
+#ifdef LWFA_DMA_TEST
+    if (!dma_manager) return 11;
+    dma_init();
+#endif
     for (unsigned i = 0; i < 2; ++i) {
-        int size = WIDTH * HEIGHT * 4;
+#ifdef LWFA_DMA_TEST
+        buffers[i].handle=dma_buffer(display,i);
+        wl_buffer_add_listener(buffers[i].handle,&buffer_listener,&buffers[i]);
+#else
+        int pixel_size=4;
+#ifdef LWFA_COLOR_TEST
+        if (scrgb_source()) pixel_size=8;
+#endif
+        int size = WIDTH * HEIGHT * pixel_size;
         int fd = memfd_create("lwfa-headless-smoke", MFD_CLOEXEC);
         if (fd < 0 || ftruncate(fd, size) < 0) return 3;
         buffers[i].pixels = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (buffers[i].pixels == MAP_FAILED) return 4;
         struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
-        buffers[i].handle = wl_shm_pool_create_buffer(pool, 0, WIDTH, HEIGHT, WIDTH * 4,
+        buffers[i].handle = wl_shm_pool_create_buffer(pool, 0, WIDTH, HEIGHT, WIDTH * pixel_size,
 #ifdef LWFA_COLOR_TEST
-            WL_SHM_FORMAT_XBGR2101010
+            scrgb_source() ? WL_SHM_FORMAT_ABGR16161616F : WL_SHM_FORMAT_XBGR2101010
 #else
             WL_SHM_FORMAT_XRGB8888
 #endif
@@ -161,16 +213,20 @@ int main(void) {
         wl_buffer_add_listener(buffers[i].handle, &buffer_listener, &buffers[i]);
         wl_shm_pool_destroy(pool);
         close(fd);
+#endif
     }
     surface = wl_compositor_create_surface(compositor);
+#ifdef LWFA_EXPLICIT_TEST
+    sync_init(surface);
+#endif
 #ifdef LWFA_COLOR_TEST
     if (!color_manager) return 7;
-    struct wp_image_description_creator_params_v1 *params = wp_color_manager_v1_create_parametric_creator(color_manager);
     const char *invalid = getenv("LWFA_TEST_COLOR_INVALID");
+    struct wp_image_description_creator_params_v1 *params = (invalid || !scrgb_source()) ? wp_color_manager_v1_create_parametric_creator(color_manager) : NULL;
     if (invalid) {
         uint32_t expected = 0;
-        if (!strcmp(invalid, "mastering")) {
-            wp_image_description_creator_params_v1_set_mastering_luminance(params, 0, 1000);
+        if (!strcmp(invalid, "unsupported")) {
+            wp_image_description_creator_params_v1_set_tf_power(params, 22000);
             expected = WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_UNSUPPORTED_FEATURE;
         } else if (!strcmp(invalid, "duplicate")) {
             wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
@@ -189,10 +245,17 @@ int main(void) {
         wl_display_disconnect(display);
         return passed ? 0 : 10;
     }
+    if (scrgb_source()) {
+        color_image=wp_color_manager_v1_create_windows_scrgb(color_manager);
+    } else {
     wp_image_description_creator_params_v1_set_primaries_named(params, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
-    wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+    wp_image_description_creator_params_v1_set_tf_named(params, source_space && !strcmp(source_space,"hlg") ? WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG : WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+    wp_image_description_creator_params_v1_set_mastering_display_primaries(params, 708000,292000,170000,797000,131000,46000,312700,329000);
+    wp_image_description_creator_params_v1_set_mastering_luminance(params, 50, 1000);
+    wp_image_description_creator_params_v1_set_luminances(params, 50, source_space && !strcmp(source_space,"hlg") ? 1000 : 10000, 203);
     wp_image_description_creator_params_v1_set_max_cll(params, 1000);
     color_image = wp_image_description_creator_params_v1_create(params);
+    }
     wp_image_description_v1_add_listener(color_image, &image_listener, NULL);
     while (!color_ready) if (wl_display_roundtrip(display) < 0) return 9;
     color_surface = wp_color_manager_v1_get_surface(color_manager, surface);
