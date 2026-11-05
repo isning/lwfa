@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest"
-import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, windowPoint } from "../src/input"
+import { edgeLeave, edgePark, isTextEntry, shouldForwardKeydown, wheelDelta, windowPoint } from "../src/input"
 
 /** A DOM-free stand-in, since these run in node. */
 class FakeElement {
@@ -231,5 +231,30 @@ describe("edgeLeave", () => {
     // No edge within reach: this is not the pointer crossing out, so it must
     // not start a pan. This is the stray up-left park the user saw.
     expect(edgeLeave({ x: 800, y: 450 }, content, reach)).toBeNull()
+  })
+})
+
+
+describe("browser wheel to Wayland axis units", () => {
+  const wheel = (deltaX: number, deltaY: number, deltaMode = 0) =>
+    wheelDelta({ deltaX, deltaY, deltaMode } as WheelEvent)
+
+  it("maps a 120-pixel browser scroll to ten Wayland axis units", () => {
+    // Native Chromium converts ten axis units back into 120 CSS pixels.
+    // Passing the browser delta through unchanged scrolls a full 1440 pixels.
+    expect(wheel(0, 120)).toEqual({ horizontal: 0, vertical: 10 })
+  })
+
+  it("preserves small continuous deltas, signs and both axes", () => {
+    const delta = wheel(-0.3, 0.6)
+    expect(delta.horizontal).toBeCloseTo(-0.025)
+    expect(delta.vertical).toBeCloseTo(0.05)
+    const pieces = Array.from({ length: 20 }, () => wheel(0, 0.6))
+    expect(pieces.reduce((sum, delta) => sum + delta.vertical, 0)).toBeCloseTo(wheel(0, 12).vertical)
+  })
+
+  it("normalizes line and page modes before converting axis units", () => {
+    expect(wheel(3, -3, 1)).toEqual(wheel(48, -48))
+    expect(wheel(0, 1, 2)).toEqual(wheel(0, 400))
   })
 })

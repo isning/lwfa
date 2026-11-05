@@ -212,18 +212,24 @@ export function edgeLeave(
 }
 
 /**
- * Scroll deltas in logical pixels.
+ * Convert browser scroll pixels into Wayland axis distances.
  *
- * `deltaMode` matters: browsers report lines or pages rather than pixels
- * depending on the device, and treating a line count as a pixel count makes the
- * wheel almost inert.
+ * The conventional Wayland distance is ten units per wheel step; Chromium
+ * expands those ten units into 120 CSS pixels. Forwarding CSS pixels verbatim
+ * therefore scrolls a remote Chromium window twelve times too far. Normalize
+ * browser line/page modes first, then convert once. Keep fractional deltas so
+ * a touchpad's small movements stay continuous rather than becoming steps.
  */
 export function wheelDelta(event: WheelEvent): { horizontal: number; vertical: number } {
   const LINE_HEIGHT = 16
   const PAGE_HEIGHT = 400
+  const PIXELS_PER_AXIS_UNIT = 120 / 10
   const scale =
     event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? PAGE_HEIGHT : 1
-  return { horizontal: event.deltaX * scale, vertical: event.deltaY * scale }
+  return {
+    horizontal: event.deltaX * scale / PIXELS_PER_AXIS_UNIT,
+    vertical: event.deltaY * scale / PIXELS_PER_AXIS_UNIT,
+  }
 }
 
 /**
