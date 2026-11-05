@@ -52,6 +52,7 @@ pub struct EncodedFrame {
 
 struct Session {
     color_generation: u64,
+    hdr_peak: f32,
     /// Which codec this session encodes, so frames can be labelled.
     codec: lwfa_proto::Codec,
     /// The rate it was built with, so a changed share can be noticed.
@@ -394,7 +395,10 @@ impl Session {
         enc.set_height(height);
         if frame.hdr {
             if wanted != lwfa_proto::Codec::HevcHdr { return Err(ff::Error::InvalidData); }
-            enc.set_format(Pixel::P010LE);
+            if crate::cuda::is_gpu(&frame.frame) {
+                enc.set_format(Pixel::CUDA);
+                if !crate::cuda::adopt_frames(&mut enc, &frame.frame) { return Err(ff::Error::InvalidData); }
+            } else { enc.set_format(Pixel::P010LE); }
             enc.set_color_primaries(ff::color::Primaries::BT2020);
             enc.set_color_transfer_characteristic(ff::color::TransferCharacteristic::SMPTE2084);
             enc.set_colorspace(ff::color::Space::BT2020NCL);
@@ -465,6 +469,7 @@ impl Session {
         Ok(Self {
             encoder,
             color_generation: frame.color_generation,
+            hdr_peak: frame.hdr_peak,
             width,
             height,
             codec: wanted,
@@ -511,6 +516,9 @@ impl Session {
             return None;
         }
 
+        if keyframe && self.codec == lwfa_proto::Codec::HevcHdr {
+            crate::hdr_metadata::insert(&mut bytes, self.hdr_peak);
+        }
         Some(EncodedFrame {
             // The wire format follows the codec this session was built for, so
             // the client knows which decoder to configure without guessing

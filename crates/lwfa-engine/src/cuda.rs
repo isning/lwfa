@@ -239,6 +239,7 @@ pub struct GpuTarget {
     /// The registered GL texture. Registration is per texture object, so a
     /// resize, which recreates the texture, recreates this too.
     resource: CUgraphicsResource,
+    p010: bool,
     tex: u32,
     width: u32,
     height: u32,
@@ -249,6 +250,15 @@ pub struct GpuTarget {
 impl GpuTarget {
     /// Bridge one texture, building the frame pool for its size.
     pub fn new(tex: u32, width: u32, height: u32) -> Option<Self> {
+        Self::new_layout(tex, width, height, false)
+    }
+
+    /// Register a normalized RGBA16 texture containing packed P010 planes.
+    pub fn new_p010(tex: u32, width: u32, height: u32) -> Option<Self> {
+        Self::new_layout(tex, width, height, true)
+    }
+
+    fn new_layout(tex: u32, width: u32, height: u32, p010: bool) -> Option<Self> {
         let device = device()?;
 
         let frames_ref = unsafe {
@@ -259,7 +269,7 @@ impl GpuTarget {
             }
             let ctx = (*frames_ref).data.cast::<ff::ffi::AVHWFramesContext>();
             (*ctx).format = ff::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
-            (*ctx).sw_format = ff::ffi::AVPixelFormat::AV_PIX_FMT_RGB0;
+            (*ctx).sw_format = if p010 { ff::ffi::AVPixelFormat::AV_PIX_FMT_P010LE } else { ff::ffi::AVPixelFormat::AV_PIX_FMT_RGB0 };
             (*ctx).width = width as c_int;
             (*ctx).height = height as c_int;
             // Enough for the frame being encoded plus the one being copied,
@@ -293,12 +303,14 @@ impl GpuTarget {
                 let mut frames_ref = frames_ref;
                 ff::ffi::av_buffer_unref(&mut frames_ref);
             }
-            disable("registering the capture texture", err);
+            if !p010 { disable("registering the capture texture", err); }
+            else { tracing::warn!(err, "HDR GL/CUDA registration unavailable; using readback"); }
             return None;
         }
 
         Some(Self {
             resource,
+            p010,
             tex,
             width,
             height,
@@ -341,7 +353,7 @@ impl GpuTarget {
                 );
                 if err == CUDA_SUCCESS {
                     let raw = frame.as_ptr();
-                    let copy = CudaMemcpy2d {
+                    let mut copy = CudaMemcpy2d {
                         src_x_in_bytes: 0,
                         src_y: 0,
                         src_memory_type: CU_MEMORYTYPE_ARRAY,
@@ -356,10 +368,18 @@ impl GpuTarget {
                         dst_device: (*raw).data[0] as CUdeviceptr,
                         dst_array: ptr::null_mut(),
                         dst_pitch: (*raw).linesize[0] as usize,
-                        width_in_bytes: self.width as usize * 4,
+                        width_in_bytes: self.width as usize * if self.p010 { 2 } else { 4 },
                         height: self.height as usize,
                     };
                     err = (device.driver.cuMemcpy2D_v2)(&copy);
+                    if self.p010 && err == CUDA_SUCCESS {
+                        copy.src_y = self.height as usize;
+                        copy.dst_device = (*raw).data[1] as CUdeviceptr;
+                        copy.dst_pitch = (*raw).linesize[1] as usize;
+                        copy.width_in_bytes = (self.width as usize).div_ceil(2) * 4;
+                        copy.height = (self.height as usize).div_ceil(2);
+                        err = (device.driver.cuMemcpy2D_v2)(&copy);
+                    }
                 }
                 let unmap =
                     (device.driver.cuGraphicsUnmapResources)(1, &mut self.resource, ptr::null_mut());

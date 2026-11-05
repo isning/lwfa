@@ -101,6 +101,8 @@ pub fn uniforms(description: Description, output_mode: f32) -> Vec<Uniform<'stat
                 Transfer::Srgb => 0.0_f32,
                 Transfer::Bt1886 => 1.0,
                 Transfer::Pq => 2.0,
+                Transfer::Linear => 3.0,
+                Transfer::Hlg => 4.0,
             },
         ),
         Uniform::new(
@@ -141,6 +143,7 @@ pub fn descriptions(surface: &WlSurface, into: &mut HashMap<Id, Description>) {
 /// Keep a per-element commit counter so changing only a description damages it.
 #[derive(Default)]
 pub struct PreviewColors {
+    source_reads: crate::source_reads::SourceReads,
     program: Option<GlesTexProgram>,
     linear: Option<(
         smithay::utils::Size<i32, smithay::utils::Physical>,
@@ -241,6 +244,9 @@ impl smithay::backend::renderer::element::Element for PreviewElement {
     }
 }
 impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for PreviewElement {
+    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+        smithay::backend::renderer::element::RenderElement::underlying_storage(&self.inner, renderer)
+    }
     fn draw(
         &self,
         frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
@@ -259,6 +265,15 @@ impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for Previe
 }
 
 impl PreviewColors {
+    pub fn render_unmanaged<E: smithay::backend::renderer::element::RenderElement<GlesRenderer>>(
+        &mut self, renderer: &mut GlesRenderer, host: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+        tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker, elements: &[E], backdrop: [f32;4],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let buffers = crate::source_reads::SourceReads::buffers(renderer, elements);
+        let result = tracker.render_output(renderer, host, 0, elements, backdrop)?;
+        self.source_reads.hold(result.sync, buffers);
+        Ok(())
+    }
     pub fn render<E: smithay::backend::renderer::element::RenderElement<GlesRenderer>>(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -289,13 +304,15 @@ impl PreviewColors {
             (crate::color::decode(v, source) - source.min_luminance) * 80.0
                 / (source.reference_white - source.min_luminance)
         });
-        tracker.render_output(
+        let source_buffers = crate::source_reads::SourceReads::buffers(renderer, elements);
+        let rendered = tracker.render_output(
             renderer,
             &mut linear,
             0,
             elements,
             [rgb[0], rgb[1], rgb[2], backdrop[3]],
         )?;
+        self.source_reads.hold(rendered.sync, source_buffers);
         drop(linear);
         if self.program.is_none() {
             self.program = Some(program(renderer)?);
@@ -440,4 +457,41 @@ mod tests {
             "fixture must distinguish 10-bit output from an 8-bit intermediate"
         );
     }
+    #[test]
+    #[ignore = "requires offscreen EGL/GLES float rendering and readback"]
+    fn extended_linear_keeps_negative_components_and_hlg_keeps_highlights() {
+        fn half(word: u16) -> f32 {
+            let sign=if word&0x8000!=0 {-1.0} else {1.0};
+            let exponent=(word>>10)&31;
+            let fraction=(word&1023) as f32;
+            sign * if exponent==0 { fraction*2.0_f32.powi(-24) } else { (1.0+fraction/1024.0)*2.0_f32.powi(exponent as i32-15) }
+        }
+        let mut renderer=crate::headless::renderer(None).unwrap();
+        let shader=program(&mut renderer).unwrap();
+        let mut source: GlesTexture=renderer.create_buffer(Fourcc::Abgr16161616f,(2,2).into()).unwrap();
+        let mut output: GlesTexture=renderer.create_buffer(Fourcc::Abgr16161616f,(2,2).into()).unwrap();
+        for (description,values,expected) in [
+            (Description { reference_white:203.0,min_luminance:0.0,..Description::named(crate::color::Primaries::Srgb,Transfer::Linear) },[-0.25,1.25,5.0],[-20.0*80.0/203.0,100.0*80.0/203.0,400.0*80.0/203.0]),
+            (Description::named(crate::color::Primaries::Bt2020,Transfer::Hlg),[0.75;3],[80.06;3]),
+        ] {
+            let mut target=renderer.bind(&mut source).unwrap();
+            let mut frame=renderer.render(&mut target,(2,2).into(),Transform::Normal).unwrap();
+            frame.clear(Color32F::new(values[0],values[1],values[2],1.0),&[Rectangle::from_size((2,2).into())]).unwrap();
+            frame.finish().unwrap().wait().unwrap(); drop(target);
+            let mut target=renderer.bind(&mut output).unwrap();
+            let mut frame=renderer.render(&mut target,(2,2).into(),Transform::Normal).unwrap();
+            frame.clear(Color32F::TRANSPARENT,&[Rectangle::from_size((2,2).into())]).unwrap();
+            frame.override_default_tex_program(shader.clone(),uniforms(description,0.0));
+            Frame::render_texture_from_to(&mut frame,&source,Rectangle::from_size((2,2).into()).to_f64(),Rectangle::from_size((2,2).into()),&[Rectangle::from_size((2,2).into())],&[],Transform::Normal,1.0).unwrap();
+            frame.finish().unwrap().wait().unwrap();
+            let mapping=renderer.copy_framebuffer(&target,Rectangle::from_size((2,2).into()),Fourcc::Abgr16161616f).unwrap(); drop(target);
+            let pixels=renderer.map_texture(&mapping).unwrap();
+            assert_eq!(pixels.len(),32,"float mappings must expose eight bytes per pixel");
+            for channel in 0..3 {
+                let actual=half(u16::from_ne_bytes(pixels[channel*2..channel*2+2].try_into().unwrap()));
+                assert!((actual-expected[channel]).abs()<expected[channel].abs()*0.003,"{description:?}, channel {channel}: {actual} vs {}",expected[channel]);
+            }
+        }
+    }
+
 }

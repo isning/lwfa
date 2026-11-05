@@ -149,6 +149,7 @@ pub struct Lwfa {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
+    pub dmabuf: crate::dmabuf::Imports,
     pub color_state: crate::color_management::ColorState,
 
     /// Smithay's 2D plane. The layout decides positions; the space holds what
@@ -441,6 +442,7 @@ impl Lwfa {
             primary: None,
             accounts: None,
             capture: SurfaceCapture::default(),
+            dmabuf: Default::default(),
             color_state: Default::default(),
             encoders: None,
             streaming: std::collections::HashSet::new(),
@@ -1840,6 +1842,8 @@ impl Lwfa {
     ///    first place, so a slow link costs no GPU read-back rather than
     ///    building an unbounded queue.
     pub fn stream_frames(&mut self, renderer: &mut smithay::backend::renderer::gles::GlesRenderer) {
+        self.capture.reap_source_reads();
+        self.import_dmabufs(renderer);
         // Session boundaries are noticed first, before anything that can
         // return early.
         //

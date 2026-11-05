@@ -1,5 +1,5 @@
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -29,6 +29,28 @@ impl CompositorHandler for Lwfa {
             .get_data::<ClientState>()
             .expect("client was inserted with ClientState")
             .compositor_state
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        use smithay::wayland::{compositor::{add_pre_commit_hook, add_blocker, with_states}, drm_syncobj::DrmSyncobjCachedState};
+        add_pre_commit_hook::<Self, _>(surface, |state, dh, surface| {
+            let point = with_states(surface, |states| states.cached_state.get::<DrmSyncobjCachedState>().pending().acquire_point.clone());
+            let Some(point) = point else { return };
+            let Some(client) = surface.client() else { return };
+            match point.generate_blocker() {
+                Ok((blocker, source)) => {
+                    let dh = dh.clone();
+                    match state.loop_handle.insert_source(source, move |_, _, state| {
+                        state.client_compositor_state(&client).blocker_cleared(state, &dh);
+                        Ok(())
+                    }) {
+                        Ok(_) => add_blocker(surface, blocker),
+                        Err(error) => { tracing::error!(?error, "could not register explicit acquire fence"); surface.post_error(0u32, "could not register acquire fence"); }
+                    }
+                }
+                Err(error) => { tracing::error!(?error, "could not create explicit acquire fence"); surface.post_error(0u32, "could not create acquire fence"); }
+            }
+        });
     }
 
     fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {

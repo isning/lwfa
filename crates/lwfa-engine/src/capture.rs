@@ -212,6 +212,8 @@ fn take_pending<M>(
 struct Target {
     texture: GlesTexture,
     linear: Option<GlesTexture>,
+    packed: Option<crate::hdr_gpu::PackedP010>,
+    hdr_bridge_attempted: bool,
     hdr: bool,
     hdr_peak: f32,
     color_generation: u64,
@@ -295,6 +297,7 @@ impl CaptureDiagnostics {
 }
 
 pub struct SurfaceCapture {
+    source_reads: crate::source_reads::SourceReads,
     hdr: bool,
     color_generation: u64,
     color_program: Option<smithay::backend::renderer::gles::GlesTexProgram>,
@@ -306,6 +309,7 @@ pub struct SurfaceCapture {
 impl Default for SurfaceCapture {
     fn default() -> Self {
         Self {
+            source_reads: Default::default(),
             hdr: false,
             color_generation: 0,
             color_program: None,
@@ -317,6 +321,7 @@ impl Default for SurfaceCapture {
 }
 
 impl SurfaceCapture {
+    pub fn reap_source_reads(&mut self) { self.source_reads.reap(); }
     pub fn enable_color(&mut self, program: smithay::backend::renderer::gles::GlesTexProgram) { self.color_program = Some(program); }
     pub fn set_hdr(&mut self, hdr: bool) {
         if self.hdr != hdr { self.hdr = hdr; self.targets.clear(); }
@@ -630,6 +635,8 @@ impl SurfaceCapture {
                 Target {
                     texture,
                     linear: if managed { Some(renderer.create_buffer(Fourcc::Abgr16161616f, buffer_size(size)).inspect_err(|err| tracing::warn!("linear color buffer unavailable: {err}")).ok()?) } else { None },
+                    hdr_bridge_attempted: false,
+                    packed: if self.hdr { crate::hdr_gpu::PackedP010::new(renderer, size).inspect_err(|err| tracing::warn!("GPU P010 packing unavailable: {err}")).ok() } else { None },
                     hdr: self.hdr,
                     hdr_peak: 203.0,
                     colors: HashMap::new(),
@@ -652,6 +659,7 @@ impl SurfaceCapture {
         target.hdr_peak = 203.0 * colors.values().map(|color| color.target_peak/color.reference_white).fold(1.0_f32, f32::max);
         target.colors = colors;
 
+        let source_buffers = crate::source_reads::SourceReads::buffers(renderer, &elements);
         let whole = Rectangle::from_size(size);
         let Ok(mut framebuffer) = renderer
             .bind(target.linear.as_mut().unwrap_or(&mut target.texture))
@@ -699,9 +707,9 @@ impl SurfaceCapture {
             // order, so the copy always sees the finished render; only the
             // *map* needs the GPU caught up, and that happens a pass later.
             // On the CUDA path the interop map does the synchronising.
-            if let Err(err) = frame.finish() {
-                tracing::warn!("capture finish failed for {id}: {err}");
-                return None;
+            match frame.finish() {
+                Ok(fence) => self.source_reads.hold(fence, source_buffers),
+                Err(err) => { tracing::warn!("capture finish failed for {id}: {err}"); return None; }
             }
         }
         drop(framebuffer);
@@ -721,6 +729,30 @@ impl SurfaceCapture {
             .or_insert_with(|| CaptureDiagnostics::new(Instant::now()))
             .counts;
         counts.rendered += 1;
+
+        if self.hdr {
+            if let (Some(packed), Some(linear)) = (target.packed.as_mut(), target.linear.as_ref()) {
+                if packed.render(renderer, linear).is_ok() {
+                    let tex = packed.texture.tex_id();
+                    let width = size.w as u32;
+                    let height = size.h as u32;
+                    if gpu_direct && crate::cuda::available() && !target.hdr_bridge_attempted {
+                        target.hdr_bridge_attempted = true;
+                        target.gpu = crate::cuda::GpuTarget::new_p010(tex, width, height);
+                    }
+                    let gpu = if gpu_direct { target.gpu.as_mut().and_then(crate::cuda::GpuTarget::frame) } else { None };
+                    let frame = if let Some(frame) = gpu {
+                        counts.gpu_direct += 1;
+                        Some(frame)
+                    } else {
+                        packed.cpu_frame(renderer).inspect_err(|err| tracing::warn!("P010 readback failed: {err}")).ok()
+                    };
+                    if let Some(frame) = frame {
+                        return Some(CapturedFrame { id, width, height, frame: PooledFrame::owned(frame), hdr: true, hdr_peak: target.hdr_peak, color_generation: target.color_generation });
+                    }
+                }
+            }
+        }
 
         // The zero-copy path: hand the rendered texture to CUDA and return
         // the frame now. If the bridge cannot be built or fails, fall through
@@ -949,7 +981,10 @@ impl CapturedFrame {
 
     /// The pixels, tightly packed RGBA. A copy; for the fallback paths only.
     pub fn packed_rgba(&self) -> Option<Vec<u8>> {
-        if self.hdr { return Some(crate::color::p010_to_srgb(&self.frame, self.hdr_peak)); }
+        if self.hdr {
+            let cpu = if crate::cuda::is_gpu(&self.frame) { crate::cuda::download(&self.frame)? } else { (*self.frame).clone() };
+            return Some(crate::color::p010_to_srgb(&cpu, self.hdr_peak));
+        }
         let frame = self.cpu_pixels()?;
         let mut out = Vec::with_capacity(self.width as usize * self.height as usize * 4);
         for row in rows(&frame, self.width, self.height) {

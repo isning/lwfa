@@ -99,6 +99,9 @@ pub struct Parameters(Mutex<ParameterSet>);
 struct ParameterSet {
     primaries: Option<Primaries>,
     transfer: Option<Transfer>,
+    luminances: Option<(u32,u32,u32)>,
+    mastering_primaries: Option<[i32;8]>,
+    mastering_luminance: Option<(u32,u32)>,
     cll: Option<u32>,
     fall: Option<u32>,
 }
@@ -155,6 +158,9 @@ impl GlobalDispatch<WpColorManagerV1, ()> for Lwfa {
         let manager = data.init(resource, ());
         manager.supported_intent(manager::RenderIntent::Perceptual);
         manager.supported_feature(manager::Feature::Parametric);
+        manager.supported_feature(manager::Feature::WindowsScrgb);
+        manager.supported_feature(manager::Feature::SetLuminances);
+        manager.supported_feature(manager::Feature::SetMasteringDisplayPrimaries);
         for primaries in [
             manager::Primaries::Srgb,
             manager::Primaries::DisplayP3,
@@ -166,6 +172,8 @@ impl GlobalDispatch<WpColorManagerV1, ()> for Lwfa {
             manager::TransferFunction::Srgb,
             manager::TransferFunction::Bt1886,
             manager::TransferFunction::St2084Pq,
+            manager::TransferFunction::ExtLinear,
+            manager::TransferFunction::Hlg,
         ] {
             manager.supported_tf_named(tf);
         }
@@ -222,6 +230,13 @@ impl Dispatch<WpColorManagerV1, ()> for Lwfa {
                     .feedback
                     .retain(|weak| weak.upgrade().is_ok());
                 state.color_state.feedback.push(feedback.downgrade());
+            }
+            manager::Request::CreateWindowsScrgb { image_description } => {
+                let mut description = Description::named(Primaries::Srgb, Transfer::Linear);
+                description.reference_white = 203.0;
+                description.min_luminance = 0.0;
+                description.target_peak = 10000.0;
+                make_image(data, image_description, Some(description), false);
             }
             manager::Request::CreateParametricCreator { obj } => {
                 data.init(obj, Parameters::default());
@@ -393,6 +408,8 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, Parameters> for Lwfa {
                     WEnum::Value(manager::TransferFunction::Srgb) => Some(Transfer::Srgb),
                     WEnum::Value(manager::TransferFunction::Bt1886) => Some(Transfer::Bt1886),
                     WEnum::Value(manager::TransferFunction::St2084Pq) => Some(Transfer::Pq),
+                    WEnum::Value(manager::TransferFunction::ExtLinear) => Some(Transfer::Linear),
+                    WEnum::Value(manager::TransferFunction::Hlg) => Some(Transfer::Hlg),
                     _ => {
                         resource.post_error(
                             params::Error::InvalidTf,
@@ -401,6 +418,20 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, Parameters> for Lwfa {
                         return;
                     }
                 };
+            }
+            params::Request::SetMasteringDisplayPrimaries { r_x,r_y,g_x,g_y,b_x,b_y,w_x,w_y } => {
+                if set.mastering_primaries.replace([r_x,r_y,g_x,g_y,b_x,b_y,w_x,w_y]).is_some() { resource.post_error(params::Error::AlreadySet, "mastering primaries already set"); }
+            }
+            params::Request::SetMasteringLuminance { min_lum,max_lum } => {
+                if set.mastering_luminance.replace((min_lum,max_lum)).is_some() { resource.post_error(params::Error::AlreadySet, "mastering luminance already set"); }
+                else if u64::from(max_lum)*10000 <= u64::from(min_lum) { resource.post_error(params::Error::InvalidLuminance, "invalid mastering range"); }
+            }
+            params::Request::SetLuminances { min_lum, max_lum, reference_lum } => {
+                if set.luminances.replace((min_lum,max_lum,reference_lum)).is_some() {
+                    resource.post_error(params::Error::AlreadySet, "luminances already set");
+                } else if u64::from(max_lum)*10000 <= u64::from(min_lum) || u64::from(reference_lum)*10000 <= u64::from(min_lum) {
+                    resource.post_error(params::Error::InvalidLuminance, "invalid luminance range");
+                }
             }
             params::Request::SetMaxCll { max_cll } => {
                 if set.cll.replace(max_cll).is_some() {
@@ -421,10 +452,25 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, Parameters> for Lwfa {
                     return;
                 };
                 let mut description = Description::named(primaries, transfer);
-                let (minimum, maximum) = (
+                if let Some((minimum,maximum,white)) = set.luminances {
+                    description.min_luminance = minimum as f32 / 10000.0;
+                    description.max_luminance = if transfer == Transfer::Pq { description.min_luminance+10000.0 } else { maximum as f32 };
+                    description.reference_white = white as f32;
+                    if white as f32 > description.max_luminance {
+                        make_image(data, image_description, None, false);
+                        return;
+                    }
+                }
+                description.mastering_primaries = set.mastering_primaries;
+                description.mastering_luminance = set.mastering_luminance;
+                if !valid_mastering(description) {
+                    make_image(data, image_description, None, false);
+                    return;
+                }
+                let (minimum, maximum) = set.mastering_luminance.unwrap_or((
                     (description.min_luminance * 10000.0) as u32,
                     description.max_luminance as u32,
-                );
+                ));
                 if set.cll.zip(set.fall).is_some_and(|(cll, fall)| fall > cll)
                     || [set.cll, set.fall]
                         .into_iter()
@@ -446,6 +492,25 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, Parameters> for Lwfa {
             ),
         }
     }
+}
+
+// Without extended_target_volume, accept only mastering volumes contained in
+// the named source triangle and luminance interval. Invalid descriptions fail
+// gracefully rather than terminating an otherwise well-formed client.
+fn valid_mastering(description: Description) -> bool {
+    if let Some((min,max)) = description.mastering_luminance {
+        if min as f32 / 10000.0 < description.min_luminance || max as f32 > description.max_luminance { return false; }
+    }
+    let Some(coords) = description.mastering_primaries else { return true };
+    let source = match description.primaries {
+        Primaries::Srgb => [[640000,330000],[300000,600000],[150000,60000]],
+        Primaries::DisplayP3 => [[680000,320000],[265000,690000],[150000,60000]],
+        Primaries::Bt2020 => [[708000,292000],[170000,797000],[131000,46000]],
+    };
+    let cross = |a: [i32;2], b: [i32;2], p: [i32;2]| (i128::from(b[0])-i128::from(a[0]))*(i128::from(p[1])-i128::from(a[1]))-(i128::from(b[1])-i128::from(a[1]))*(i128::from(p[0])-i128::from(a[0]));
+    let points: Vec<_> = coords.chunks_exact(2).map(|xy| [xy[0],xy[1]]).collect();
+    if cross(points[0],points[1],points[2]) == 0 { return false; }
+    points.iter().all(|&p| (0..3).all(|i| cross(source[i],source[(i+1)%3],p)>=0))
 }
 
 impl Dispatch<WpImageDescriptionV1, ImageData> for Lwfa {
@@ -531,5 +596,22 @@ impl Dispatch<WpImageDescriptionCreatorIccV1, ()> for Lwfa {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mastering_volume_must_fit_named_source_without_extended_feature() {
+        let mut description=Description::named(Primaries::Bt2020,Transfer::Pq);
+        description.mastering_primaries=Some([640000,330000,300000,600000,150000,60000,312700,329000]);
+        description.mastering_luminance=Some((50,1000));
+        assert!(valid_mastering(description));
+        description.mastering_primaries=Some([708000,292000,170000,797000,131000,46000,312700,329000]);
+        description.primaries=Primaries::Srgb;
+        assert!(!valid_mastering(description));
+        description.mastering_primaries=Some([i32::MIN,i32::MAX,i32::MAX,i32::MIN,0,0,0,0]);
+        assert!(!valid_mastering(description));
     }
 }

@@ -20,6 +20,7 @@ lwfa-proto = { path = "../lwfa-proto" }
 # x11rb and runs a real Xwayland server as a child process.
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
+    "backend_drm",
     "wayland_frontend",
     "desktop",
     "xwayland",

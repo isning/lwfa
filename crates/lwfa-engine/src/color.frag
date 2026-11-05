@@ -27,7 +27,15 @@ const float c1 = 0.8359375;
 const float c2 = 18.8515625;
 const float c3 = 18.6875;
 vec3 decode(vec3 v) {
+    // Extended linear scRGB deliberately retains negative components.
+    if (source_tf > 2.5 && source_tf < 3.5) return v * (source_peak-source_black);
     v = max(v, vec3(0.0));
+    if (source_tf > 3.5) {
+        vec3 scene = mix(v*v/3.0, (exp((v-0.55991073)/0.17883277)+0.28466892)/12.0, step(vec3(0.5),v));
+        vec3 weights = source_primaries > 1.5 ? vec3(0.2627,0.6780,0.0593) : vec3(0.2126,0.7152,0.0722);
+        float gamma = 1.2 + 0.42 * log(source_peak/1000.0)/log(10.0);
+        return scene * pow(max(dot(scene,weights),0.0000001),gamma-1.0) * (source_peak-source_black);
+    }
     if (source_tf > 1.5) {
         vec3 p = pow(v, vec3(1.0 / m2));
         return pow(max(p - c1, vec3(0.0)) / (c2 - c3 * p), vec3(1.0 / m1)) * 10000.0;

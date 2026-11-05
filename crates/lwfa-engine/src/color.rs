@@ -17,6 +17,8 @@ pub enum Transfer {
     Srgb,
     Bt1886,
     Pq,
+    Linear,
+    Hlg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,6 +29,8 @@ pub struct Description {
     pub min_luminance: f32,
     pub max_luminance: f32,
     pub target_peak: f32,
+    pub mastering_primaries: Option<[i32;8]>,
+    pub mastering_luminance: Option<(u32,u32)>,
 }
 
 impl Default for Description {
@@ -38,6 +42,8 @@ impl Default for Description {
             min_luminance: 0.2,
             max_luminance: 80.0,
             target_peak: 80.0,
+            mastering_primaries: None,
+            mastering_luminance: None,
         }
     }
 }
@@ -45,6 +51,8 @@ impl Default for Description {
 impl Description {
     pub fn named(primaries: Primaries, transfer: Transfer) -> Self {
         match transfer {
+            Transfer::Linear => Self { primaries, transfer, reference_white: 80.0, min_luminance: 0.2, max_luminance: 80.0, target_peak: 80.0, ..Self::default() },
+            Transfer::Hlg => Self { primaries, transfer, reference_white: 203.0, min_luminance: 0.005, max_luminance: 1000.0, target_peak: 1000.0, ..Self::default() },
             Transfer::Pq => Self {
                 primaries,
                 transfer,
@@ -52,6 +60,7 @@ impl Description {
                 min_luminance: 0.005,
                 max_luminance: 10000.005,
                 target_peak: 10000.0,
+                ..Self::default()
             },
             Transfer::Bt1886 => Self {
                 primaries,
@@ -60,6 +69,7 @@ impl Description {
                 min_luminance: 0.01,
                 max_luminance: 100.0,
                 target_peak: 100.0,
+                ..Self::default()
             },
             Transfer::Srgb => Self {
                 primaries,
@@ -76,8 +86,14 @@ const C2: f32 = 2413.0 / 128.0;
 const C3: f32 = 2392.0 / 128.0;
 
 pub fn decode(value: f32, description: Description) -> f32 {
+    if description.transfer == Transfer::Linear { return value * (description.max_luminance-description.min_luminance)+description.min_luminance; }
     let value = value.clamp(0.0, 1.0);
     match description.transfer {
+        Transfer::Linear => unreachable!(),
+        Transfer::Hlg => {
+            let scene = if value <= 0.5 { value*value/3.0 } else { (((value-0.5599107)/0.17883277).exp()+0.28466892)/12.0 };
+            scene.powf(1.2 + 0.42*(description.max_luminance/1000.0).log10()) * (description.max_luminance-description.min_luminance) + description.min_luminance
+        }
         Transfer::Srgb => {
             (if value <= 0.04045 {
                 value / 12.92
@@ -222,6 +238,21 @@ pub fn p010_to_srgb(frame: &ffmpeg_next::frame::Video, peak: f32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_linear_preserves_negative_and_superwhite_values() {
+        let source=Description::named(Primaries::Srgb,Transfer::Linear);
+        assert!((decode(-0.5,source)+39.7).abs()<0.001);
+        assert!(decode(12.5,source)>990.0);
+    }
+
+    #[test]
+    fn hlg_default_display_maps_reference_and_peak() {
+        let source=Description::named(Primaries::Bt2020,Transfer::Hlg);
+        assert!((decode(0.75,source)-203.15).abs()<0.2);
+        assert!((decode(1.0,source)-1000.0).abs()<0.1);
+        assert!((decode(0.0,source)-0.005).abs()<0.00001);
+    }
 
     #[test]
     fn p010_conversion_uses_limited_range_bt2020_and_preserves_sdr_fallback_white() {

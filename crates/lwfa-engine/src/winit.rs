@@ -412,7 +412,7 @@ pub fn init_winit(
                                 if let Err(err) = preview_colors.render(renderer, &mut framebuffer, &mut damage_tracker, &elements, preview_size, backdrop) {
                                     tracing::error!("color preview failed: {err}");
                                 }
-                            } else if let Err(err) = damage_tracker.render_output(renderer, &mut framebuffer, 0, &elements, backdrop) {
+                            } else if let Err(err) = preview_colors.render_unmanaged(renderer, &mut framebuffer, &mut damage_tracker, &elements, backdrop) {
                                 tracing::error!("render failed: {err}");
                             }
                         }
