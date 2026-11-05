@@ -514,7 +514,7 @@ fn valid_mastering(description: Description) -> bool {
 
 impl Dispatch<WpImageDescriptionV1, ImageData> for Lwfa {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         resource: &WpImageDescriptionV1,
         request: image::Request,
@@ -569,7 +569,14 @@ impl Dispatch<WpImageDescriptionV1, ImageData> for Lwfa {
                 (description.min_luminance * 10000.0) as u32,
                 description.max_luminance as u32,
             );
-            information.done();
+            // `done` destroys this new resource. The Wayland backend installs
+            // its object data after this request returns, so destroying it here
+            // would remove the object before that installation and panic.
+            state.loop_handle.insert_idle(move |_| {
+                if information.is_alive() {
+                    information.done();
+                }
+            });
         }
     }
 }
@@ -614,3 +621,7 @@ mod tests {
         assert!(!valid_mastering(description));
     }
 }
+
+#[cfg(test)]
+#[path = "color_management_tests.rs"]
+mod protocol_tests;
