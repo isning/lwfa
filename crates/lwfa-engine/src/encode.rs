@@ -512,10 +512,14 @@ impl Session {
         }
         self.pts += 1;
 
-        self.encoder.send_frame(source).ok()?;
+        {
+            let _submit_timing = crate::telemetry::Span::new("encoderSubmit");
+            self.encoder.send_frame(source).ok()?;
+        }
 
         // The encoder may emit several packets, or none. Concatenating is
         // correct for Annex B, where packets are just NAL units in order.
+        let _output_timing = crate::telemetry::Span::new("encoderOutput");
         let mut bytes = Vec::new();
         let mut keyframe = false;
         let mut packet = ff::Packet::empty();

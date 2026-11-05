@@ -4,6 +4,7 @@ import {
   count,
   resetFrameTimings,
   bufferedMediaKiB,
+  latestVideoSample,
 } from "./performance"
 import { statsNow, subscribe as subscribeStreamStats } from "./streamStats"
 import { diagnostics as audioDiagnostics } from "./audio"
@@ -52,6 +53,7 @@ export function recordPerformance(): () => void {
       fps: stream.fps,
       kbits: stream.kbits,
       bufferedKiB: bufferedMediaKiB(),
+      video: latestVideoSample(),
     })
   }, 1000)
   return () => {

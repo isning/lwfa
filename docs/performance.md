@@ -5,11 +5,27 @@ local to this browser, off by default, and independent of codec and presentation
 preferences. Closing the panel keeps recording; disabling the switch pauses it.
 
 The panel keeps up to five minutes / 300 samples. Choose a one- or five-minute
-view, P95 or maximum, and Processing, Network, Frame intervals or Audio. Hover the
-chart or use its keyboard-accessible sample slider to inspect values. Legend
-buttons toggle individual curves. Expand Stage breakdown for P50/P95/max/count,
-or the counter section for drops, replacements and encoder opens. Clear resets
-this tab's history; Export JSON saves the current samples and measurement scope.
+view and P50, P95 or maximum. Short recordings fit the available time span rather
+than leaving most of a five-minute chart empty. Groups cover Overview, Encoder,
+Browser, Transport, Input/control, Frame intervals and Audio.
+
+Hover for a preview; click the chart or use its keyboard-accessible sample slider
+to pin an actual timestamp. Recording continues while the readouts and stage
+table inspect that point. **Follow latest** returns to the newest data. A pinned
+sample that leaves the selected time range is identified rather than silently
+moving to another sample. Legend buttons toggle curves. Linear and log(1 + ms)
+scales share the same underlying data; the logarithmic view keeps zero visible
+and makes smaller costs readable alongside large spikes. The 60 fps line is a
+frame-interval reference, not a measured end-to-end budget.
+
+The compact readouts include Encode P95, browser receive-to-first-submit P95,
+control RTT P50 and decoded FPS. The last observed wire frame supplies physical
+dimensions, codec and a numeric window ID; it is not a claim about every window
+included in process-wide server measurements. Expand Stage breakdown for the
+measured P50/P95/max/count values, or Frame flow & events for timestamped counter
+trends and totals. Counters are per sample, not necessarily per second when a tab
+is throttled. **Clear** resets this tab's history; **JSON** exports all retained
+samples, not just the selected chart range.
 
 ## What the numbers mean
 
@@ -28,6 +44,8 @@ must not be added together to manufacture an end-to-end latency.
 | Encoder queue | Job submission → worker dequeue/control application | Only admitted frames |
 | Encode | Encode call → encoded result | Includes session creation and fallback work |
 | Encoder session open | Session construction call | A substage of encode; never add it to encode |
+| Encoder frame submission | FFmpeg send_frame call | May include driver waiting and input preparation; a CPU elapsed call, not a pure NVENC execution timestamp |
+| Bitstream retrieval / processing | After submission → encoded output assembled | Includes packet retrieval, copying, filtering and HDR metadata; also a substage of encode |
 | Server send queue | Encoded frame fan-out → transport dequeue | Aggregates viewers/windows on this process |
 | QUIC fragment enqueue | All fragments of one packet handed to QUIC, or failure | Includes local pacing; does not prove network delivery |
 | WebSocket write → kernel flush | First queued media write → successful socket flush | Kernel acceptance is not client receipt |
@@ -68,7 +86,9 @@ the last two seconds; server values become stale after three seconds without a
 report. History and exported data contain numbers, metric names and timing only:
 no credentials, URLs, window titles, input content, pixels or audio samples.
 The export includes the browser time origin so monotonic sample timestamps can
-be mapped to wall time. Paused/background tabs may produce fewer timeline points.
+be mapped to wall time, plus the last observed wire frame's dimensions, codec,
+numeric window ID and observation time. Paused/background tabs may produce fewer
+timeline points.
 
 Export version 2 measures frame waiting and receive-to-submission only for the
 first successful submission of each new frame. Later Canvas repaints count as
@@ -96,10 +116,12 @@ Those require additional causal instrumentation or external display measurement.
 
 Run `pnpm test`, `pnpm typecheck`, `cargo test --workspace` (after TypeScript parity
 fixtures), and the production build. Recorder tests cover bounds, stale samples,
-server counter baselines/restarts, clear/pause, frame timing propagation and
-protocol validation. Connection tests cover old-server capability gating and
-cancelled recording probes. Native video ownership/replacement tests remain in
-`native-hdr.test.ts`.
+server counter baselines/restarts, clear/pause, frame timing propagation,
+first-submission/redraw separation, async reset boundaries and protocol
+validation. Chart tests cover fitted history, real elapsed time and linear/log
+axes. Connection tests cover old-server capability gating and cancelled recording
+probes. Native video tests include bounded ownership/replacement and deduplication
+of repeated source frames in `native-hdr.test.ts`.
 
 On a disposable session, run a continuously animated native app, enable recording,
 then switch between Canvas and Native video. Processing should show the matching

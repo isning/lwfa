@@ -4,6 +4,7 @@ import type {
   PerformanceStage,
   DecodedFrame,
 } from "@lwfa/proto"
+import { FrameFormat } from "@lwfa/proto"
 
 export const METRICS = {
   controlRtt: { label: "Control round trip", group: "network", unit: "ms" },
@@ -27,6 +28,16 @@ export const METRICS = {
     unit: "ms",
   },
   encoderOpen: { label: "Encoder session open", group: "server", unit: "ms" },
+  encoderSubmit: {
+    label: "Encoder frame submission",
+    group: "server",
+    unit: "ms",
+  },
+  encoderOutput: {
+    label: "Bitstream retrieval / processing",
+    group: "server",
+    unit: "ms",
+  },
   sendQueue: { label: "Server send queue", group: "network", unit: "ms" },
   websocketFlush: {
     label: "WebSocket write → kernel flush",
@@ -70,7 +81,11 @@ export const METRICS = {
   },
   rafGap: { label: "Browser animation interval", group: "cadence", unit: "ms" },
   longTask: { label: "Browser long task", group: "cadence", unit: "ms" },
-  audioCaptureWait: { label: "Server audio read wait", group: "audio", unit: "ms" },
+  audioCaptureWait: {
+    label: "Server audio read wait",
+    group: "audio",
+    unit: "ms",
+  },
   audioEncode: { label: "Server Opus encode", group: "audio", unit: "ms" },
   audioDecode: { label: "Audio decode", group: "audio", unit: "ms" },
   audioSend: { label: "Server audio enqueue", group: "audio", unit: "ms" },
@@ -113,6 +128,14 @@ export interface PerformancePoint {
   fps: number
   kbits: number
   bufferedKiB: number
+  video?: VideoSample | null
+}
+export interface VideoSample {
+  window: number
+  width: number
+  height: number
+  codec: string
+  receivedAt: number
 }
 export interface PerformanceSnapshot {
   enabled: boolean
@@ -193,7 +216,13 @@ export class PerformanceRecorder {
         this.#remoteCounts[name] = counter.value
       }
   }
-  tick(at: number, gauges = { fps: 0, kbits: 0, bufferedKiB: 0 }): void {
+  tick(
+    at: number,
+    gauges: Pick<
+      PerformancePoint,
+      "fps" | "kbits" | "bufferedKiB" | "video"
+    > = { fps: 0, kbits: 0, bufferedKiB: 0 },
+  ): void {
     if (!this.enabled) return
     const stages: PerformancePoint["stages"] = {}
     for (const [name, samples] of this.#samples) {
@@ -299,6 +328,16 @@ interface RenderTiming {
 let timingEpoch = 0
 let timings = new WeakMap<object, FrameTiming>()
 const arrivals = new Map<number, number>()
+let lastVideo: VideoSample | null = null
+const CODEC_NAMES = {
+  [FrameFormat.Jpeg]: "JPEG",
+  [FrameFormat.H264]: "H.264",
+  [FrameFormat.Hevc]: "HEVC",
+  [FrameFormat.HevcHdr]: "HEVC Main10 HDR",
+}
+export function latestVideoSample(): VideoSample | null {
+  return lastVideo
+}
 export function frameReceived(frame: DecodedFrame): void {
   if (!performanceStats.enabled) return
   const now = performance.now(),
@@ -306,6 +345,15 @@ export function frameReceived(frame: DecodedFrame): void {
   if (last !== undefined) observe("arrivalGap", now - last)
   if (arrivals.size >= 128) arrivals.delete(arrivals.keys().next().value!)
   arrivals.set(frame.header.window, now)
+  const { width, height, format, window } = frame.header
+  if (width > 0 && height > 0)
+    lastVideo = {
+      window,
+      width,
+      height,
+      codec: CODEC_NAMES[format],
+      receivedAt: now,
+    }
   timings.set(frame, { epoch: timingEpoch, received: now })
   count("receivedFrames")
 }
@@ -368,6 +416,7 @@ export function resetFrameTimings(): void {
   timingEpoch++
   timings = new WeakMap()
   arrivals.clear()
+  lastVideo = null
 }
 export function exportPerformance(snapshot: PerformanceSnapshot): string {
   return JSON.stringify(

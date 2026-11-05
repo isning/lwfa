@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react"
+import { useState } from "react"
 import { Download, RotateCcw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
@@ -12,24 +12,44 @@ import {
   resetFrameTimings,
   exportPerformance,
   type Metric,
+  type Counter,
   type PerformancePoint,
 } from "@/lib/performance"
+import type { ChartScale } from "@/lib/performanceChart"
+import { PerformanceChart, formatValue, sampleClock } from "./PerformanceChart"
 import { cn } from "@/lib/utils"
 
 const VIEWS = {
   processing: {
-    title: "Processing",
+    title: "Overview",
+    keys: ["encode", "capture", "decode", "frameWait", "nativeWrite", "render"],
+    hint: "Independent stage distributions; do not add their percentiles. Submission timing stops before physical display.",
+  },
+  encoder: {
+    title: "Encoder",
     keys: [
-      "capture",
-      "encoderQueue",
       "encode",
-      "decode",
-      "render",
-      "nativeWrite",
+      "encoderQueue",
+      "encoderOpen",
+      "encoderSubmit",
+      "encoderOutput",
     ],
+    hint: "Session open, submission and bitstream output are parts of Encode, not additional delay. Near-zero queueing does not rule out capture being skipped while the encoder is busy.",
+  },
+  client: {
+    title: "Browser",
+    keys: [
+      "decode",
+      "convert",
+      "frameWait",
+      "nativeWrite",
+      "render",
+      "receiveToSubmit",
+    ],
+    hint: "Waiting and receive-to-submission measure the first successful submission of each new frame. Cached redraws are counted separately.",
   },
   network: {
-    title: "Network",
+    title: "Transport",
     keys: [
       "controlRtt",
       "transportRtt",
@@ -39,38 +59,86 @@ const VIEWS = {
       "reassembly",
       "reorder",
     ],
+    hint: "RTT is round trip. Enqueue/flush stops at the local transport; reassembly combines audio and video. These are not one-way latency or a packet-loss percentage.",
+  },
+  control: {
+    title: "Input / control",
+    keys: ["controlRtt", "controlQueue", "inputDispatch"],
+    hint: "Dispatch ends in the compositor, before the application handles input. Control RTT includes transport and handling.",
   },
   cadence: {
     title: "Frame intervals",
     keys: ["captureGap", "arrivalGap", "videoCallback", "rafGap", "longTask"],
+    hint: "Idle applications naturally have long capture/arrival/video callback gaps. Long tasks are browser observations, not custom fault classifications.",
   },
-  audio: { title: "Audio", keys: ["audioCaptureWait", "audioEncode", "audioSend", "audioDecode", "audioBuffer"] },
-} satisfies Record<string, { title: string; keys: Metric[] }>
-const COLORS = [
-  "#e68a46",
-  "#329fb5",
-  "#b88adb",
-  "#76a85d",
-  "#dc6c87",
-  "#7d94df",
-  "#aa9b52",
-]
-const ms = (value: number | undefined) =>
-  value === undefined ? "—" : value < 10 ? value.toFixed(2) : value.toFixed(1)
-const clock = (at: number) =>
-  new Date(performance.timeOrigin + at).toLocaleTimeString(undefined, {
-    hour12: false,
-  })
+  audio: {
+    title: "Audio",
+    keys: [
+      "audioBuffer",
+      "audioCaptureWait",
+      "audioEncode",
+      "audioDecode",
+      "audioSend",
+    ],
+    hint: "Playback buffer contributes local audio delay. Capture read wait includes the normal PCM chunk production period; it is not CPU encoding time.",
+  },
+} satisfies Record<string, { title: string; keys: Metric[]; hint: string }>
+const EVENTS = {
+  frames: {
+    title: "Frame flow",
+    keys: [
+      "receivedFrames",
+      "renderedFrames",
+      "redraws",
+      "nativeReplaced",
+      "nativeDropped",
+    ],
+  },
+  transport: {
+    title: "Transport",
+    keys: [
+      "sendExpired",
+      "receiptTimeouts",
+      "incompleteFrames",
+      "dependencyDrops",
+      "recoveries",
+    ],
+  },
+  encoder: {
+    title: "Encoder",
+    keys: [
+      "encoderOpens",
+      "encoderDrops",
+      "encodeFailures",
+      "sendBackpressure",
+    ],
+  },
+  audio: { title: "Audio", keys: ["audioUnderruns", "probeTimeouts"] },
+} satisfies Record<string, { title: string; keys: Counter[] }>
 type View = keyof typeof VIEWS
-type Percentile = "p95" | "max"
+type Statistic = "p50" | "p95" | "max"
+const selectClass =
+  "min-h-9 min-w-0 rounded-md border border-input bg-background px-2 text-xs"
 
 export function PerformancePanel() {
-  const { stream } = usePrefs()
-  const state = usePerformance()
+  const { stream } = usePrefs(),
+    state = usePerformance()
   const [view, setView] = useState<View>("processing")
-  const [percentile, setPercentile] = useState<Percentile>("p95")
-  const [seconds, setSeconds] = useState(300)
+  const [statistic, setStatistic] = useState<Statistic>("p95")
+  const [seconds, setSeconds] = useState(60)
+  const [scale, setScale] = useState<ChartScale>("linear")
+  const [selectedAt, setSelectedAt] = useState<number | null>(null)
+  const [events, setEvents] = useState<keyof typeof EVENTS>("frames")
   const latest = state.points.at(-1)
+  const inspected =
+    selectedAt === null
+      ? latest
+      : state.points.find((point) => point.at === selectedAt)
+  const duration =
+    latest && state.points[0] ? (latest.at - state.points[0].at) / 1000 : 0
+  const sampled = (Object.keys(METRICS) as Metric[]).filter(
+    (key) => inspected?.stages[key],
+  )
   const exportData = () => {
     const url = URL.createObjectURL(
       new Blob([exportPerformance(state)], { type: "application/json" }),
@@ -81,18 +149,23 @@ export function PerformancePanel() {
     link.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
+  const clear = () => {
+    setSelectedAt(null)
+    resetFrameTimings()
+    performanceStats.clear()
+  }
   return (
     <PanelSection
       title="Performance"
-      description="Local stage timings and server measurements. Up to five minutes of history."
+      description="Trace stage costs and frame flow. Recording stays on when this panel closes."
     >
       <PanelGroup>
-        <FieldRow>
+        <FieldRow className="py-2.5">
           <div>
             <div className="text-sm font-medium">Record diagnostics</div>
-            <div className="text-xs text-muted-foreground">
-              One-second updates · bounded history
-            </div>
+            <p className="text-xs text-muted-foreground">
+              One-second samples · five-minute history
+            </p>
           </div>
           <Switch
             checked={stream.diagnostics}
@@ -102,9 +175,15 @@ export function PerformancePanel() {
             aria-label="Record performance diagnostics"
           />
         </FieldRow>
-        {(state.enabled || state.points.length > 0) && (
+        {!state.enabled && state.points.length === 0 ? (
+          <p className="border-t border-border px-3 py-3 text-xs leading-relaxed text-muted-foreground">
+            Enable recording, then interact with an application. Charts show
+            measured costs and intervals; an idle window may produce no new
+            video samples.
+          </p>
+        ) : (
           <>
-            <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
               <span className="inline-flex items-center gap-1.5">
                 <span
                   aria-hidden
@@ -117,112 +196,203 @@ export function PerformancePanel() {
                 {state.server === "supported"
                   ? "Server + browser"
                   : state.server === "waiting"
-                    ? "Waiting for server sample"
+                    ? "Waiting for server"
                     : state.server === "checking"
-                      ? "Checking server support"
-                      : "Browser measurements"}
+                      ? "Checking server"
+                      : "Browser only"}
               </span>
-              <span className="font-mono">{state.points.length} samples</span>
+              <span className="font-mono">
+                {state.points.length} points ·{" "}
+                {duration < 60
+                  ? `${Math.round(duration)}s`
+                  : `${Math.floor(duration / 60)}m ${Math.round(duration % 60)}s`}
+              </span>
             </div>
-            <div className="grid grid-cols-3 border-t border-border px-3 py-3 text-xs">
+            <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
+              <span className="min-w-0 text-[11px] text-muted-foreground">
+                {selectedAt === null ? "Latest sample" : "Pinned sample"} ·{" "}
+                <span className="font-mono">
+                  {inspected
+                    ? sampleClock(inspected.at)
+                    : selectedAt === null
+                      ? "Waiting"
+                      : "Expired"}
+                </span>
+              </span>
+              <div className="flex shrink-0 gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2 text-[11px]"
+                  onClick={exportData}
+                  disabled={!state.points.length}
+                  aria-label="Export performance JSON"
+                >
+                  <Download className="size-3.5" aria-hidden />
+                  JSON
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2 text-[11px]"
+                  onClick={clear}
+                  aria-label="Clear performance recording"
+                >
+                  <RotateCcw className="size-3.5" aria-hidden />
+                  Clear
+                </Button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4 border-t border-border px-3 py-3">
               <NumberReadout
-                label="CONTROL RTT"
-                value={ms(latest?.stages.controlRtt?.p50)}
+                label="Encode · P95"
+                value={formatValue(inspected?.stages.encode?.p95)}
                 unit="ms"
               />
               <NumberReadout
-                label="CLIENT → SUBMIT"
-                value={ms(latest?.stages.receiveToSubmit?.p95)}
+                label="Receive → first submit · P95"
+                value={formatValue(inspected?.stages.receiveToSubmit?.p95)}
                 unit="ms"
               />
               <NumberReadout
-                label="RECEIVED"
-                value={latest ? String(latest.fps) : "—"}
+                label="Control RTT · P50"
+                value={formatValue(inspected?.stages.controlRtt?.p50)}
+                unit="ms"
+              />
+              <NumberReadout
+                label="Decoded frame rate"
+                value={inspected ? String(inspected.fps) : "—"}
                 unit="fps"
               />
             </div>
-            <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 pt-3">
-              <select
-                className="min-h-9 rounded-md border border-input bg-background px-2 text-xs"
-                aria-label="Performance chart group"
-                value={view}
-                onChange={(event) => setView(event.target.value as View)}
-              >
-                {Object.entries(VIEWS).map(([key, value]) => (
-                  <option key={key} value={key}>
-                    {value.title}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="min-h-9 rounded-md border border-input bg-background px-2 text-xs"
-                aria-label="Performance chart statistic"
-                value={percentile}
-                onChange={(event) =>
-                  setPercentile(event.target.value as Percentile)
-                }
-              >
-                <option value="p95">P95</option>
-                <option value="max">Maximum</option>
-              </select>
-              <select
-                className="min-h-9 rounded-md border border-input bg-background px-2 text-xs"
-                aria-label="Performance history range"
-                value={seconds}
-                onChange={(event) => setSeconds(Number(event.target.value))}
-              >
-                <option value={60}>1 min</option>
-                <option value={300}>5 min</option>
-              </select>
-            </div>
-            <TrendChart
-              points={state.points}
-              keys={VIEWS[view].keys}
-              statistic={percentile}
-              seconds={seconds}
-            />
-            <div className="space-y-1 px-3 pb-3 text-[11px] leading-relaxed text-muted-foreground">
-              {view === "cadence" ? (
-                <p>
-                  Arrival and video callback gaps include idle applications.
-                  Long tasks measure browser work over 50 ms; no automatic stall
-                  classification is applied.
-                </p>
-              ) : view === "network" ? (
-                <p>
-                  RTT is a round trip. Enqueue/flush stops at the local
-                  transport, not at the viewer. Reassembly drops are not a
-                  packet-loss percentage.
-                </p>
-              ) : view === "audio" ? (
-                <p>
-                  Audio buffer is local playback delay. Decode and enqueue do
-                  not include the application or speaker.
+            <div className="space-y-1 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+              {inspected?.video ? (
+                <p className="font-mono">
+                  Last video · {inspected.video.width}×{inspected.video.height}{" "}
+                  · {inspected.video.codec} · w{inspected.video.window}
                 </p>
               ) : (
-                <p>
-                  Stages are independent samples. Do not add percentiles
-                  together. Receive → submission excludes network and
-                  application time.
+                <p>No video frame metadata in this sample</p>
+              )}
+              {inspected && (
+                <p className="font-mono">
+                  {inspected.kbits.toLocaleString()} kbit/s ·{" "}
+                  {inspected.bufferedKiB.toFixed(1)} KiB buffered media
                 </p>
               )}
-              <p>
-                Canvas submission and native-video callbacks do not measure
-                physical screen presentation. Server stages cover all windows
-                and viewers; browser stages cover this tab.
+              {inspected && !inspected.counters.receivedFrames && (
+                <p>No new video frames counted in this sample.</p>
+              )}
+            </div>
+            <div className="space-y-3 border-t border-border px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <h4 className="text-xs font-medium">Stage timings</h4>
+                <span className="text-[10px] text-muted-foreground">
+                  Click or use slider to pin
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="space-y-1 text-[10px] text-muted-foreground">
+                  Stage group
+                  <select
+                    className={`${selectClass} block w-full text-foreground`}
+                    aria-label="Performance chart group"
+                    value={view}
+                    onChange={(event) => setView(event.target.value as View)}
+                  >
+                    {Object.entries(VIEWS).map(([key, value]) => (
+                      <option key={key} value={key}>
+                        {value.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1 text-[10px] text-muted-foreground">
+                  Statistic
+                  <select
+                    className={`${selectClass} block w-full text-foreground`}
+                    aria-label="Performance chart statistic"
+                    value={statistic}
+                    onChange={(event) =>
+                      setStatistic(event.target.value as Statistic)
+                    }
+                  >
+                    <option value="p50">P50 · median</option>
+                    <option value="p95">P95</option>
+                    <option value="max">Maximum</option>
+                  </select>
+                </label>
+                <label className="space-y-1 text-[10px] text-muted-foreground">
+                  History
+                  <select
+                    className={`${selectClass} block w-full text-foreground`}
+                    aria-label="Performance history range"
+                    value={seconds}
+                    onChange={(event) => setSeconds(Number(event.target.value))}
+                  >
+                    <option value={60}>Last minute</option>
+                    <option value={300}>Last five minutes</option>
+                  </select>
+                </label>
+                <label className="space-y-1 text-[10px] text-muted-foreground">
+                  Scale
+                  <select
+                    className={`${selectClass} block w-full text-foreground`}
+                    aria-label="Performance chart scale"
+                    value={scale}
+                    onChange={(event) =>
+                      setScale(event.target.value as ChartScale)
+                    }
+                  >
+                    <option value="linear">Linear</option>
+                    <option value="log">Log · keep spikes visible</option>
+                  </select>
+                </label>
+              </div>
+              <PerformanceChart
+                points={state.points}
+                series={VIEWS[view].keys.map((key) => ({
+                  key,
+                  label: METRICS[key].label,
+                  read: (point) => point.stages[key]?.[statistic],
+                }))}
+                seconds={seconds}
+                scale={scale}
+                selectedAt={selectedAt}
+                onSelect={setSelectedAt}
+                unit="ms"
+                title={`${VIEWS[view].title} latency`}
+                reference={
+                  view === "encoder" ||
+                  view === "processing" ||
+                  view === "cadence"
+                    ? 1000 / 60
+                    : undefined
+                }
+              />
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                {VIEWS[view].hint}
               </p>
-              {latest && (
-                <p className="font-mono">
-                  {latest.kbits.toLocaleString()} kbit/s ·{" "}
-                  {latest.bufferedKiB.toFixed(1)} KiB media awaiting assembly
+              {scale === "log" && (
+                <p className="text-[10px] text-muted-foreground">
+                  Log(1 + ms) keeps zero visible while compressing large spikes.
+                  Values and exports remain unchanged.
                 </p>
               )}
             </div>
             <details className="border-t border-border">
-              <summary className="min-h-10 cursor-pointer px-3 py-2.5 text-xs font-medium">
-                Stage breakdown
+              <summary className="min-h-11 cursor-pointer px-3 py-3 text-xs font-medium">
+                Stage breakdown{" "}
+                <span className="ml-1 font-mono text-[10px] font-normal text-muted-foreground">
+                  {sampled.length} measured
+                </span>
               </summary>
               <div className="overflow-x-auto px-3 pb-3">
+                <p className="pb-2 text-[10px] text-muted-foreground">
+                  {selectedAt === null ? "Latest" : "Pinned"} sample ·{" "}
+                  {inspected ? sampleClock(inspected.at) : "expired"} · rolling
+                  two-second windows
+                </p>
                 <table className="w-full text-[11px] tabular-nums">
                   <thead>
                     <tr className="border-b border-border text-right text-muted-foreground">
@@ -230,84 +400,125 @@ export function PerformancePanel() {
                       <th className="pb-2 font-normal">P50</th>
                       <th className="pb-2 font-normal">P95</th>
                       <th className="pb-2 font-normal">Max</th>
-                      <th className="pb-2 font-normal">N</th>
+                      <th className="pb-2 pl-2 font-normal">N</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {(Object.keys(METRICS) as Metric[]).map((key) => {
-                      const sample = latest?.stages[key]
+                    {sampled.map((key) => {
+                      const sample = inspected!.stages[key]!
                       return (
                         <tr
                           key={key}
                           className="border-b border-border/40 last:border-0"
                         >
-                          <td className="py-1.5 pr-2 text-muted-foreground">
+                          <td className="py-2 pr-2 text-muted-foreground">
                             {METRICS[key].label}
                           </td>
                           <td className="text-right font-mono">
-                            {ms(sample?.p50)}
+                            {formatValue(sample.p50)}
                           </td>
                           <td className="text-right font-mono">
-                            {ms(sample?.p95)}
+                            {formatValue(sample.p95)}
                           </td>
                           <td className="text-right font-mono">
-                            {ms(sample?.max)}
+                            {formatValue(sample.max)}
                           </td>
                           <td className="pl-2 text-right font-mono text-muted-foreground">
-                            {sample?.samples ?? 0}
+                            {sample.samples}
                           </td>
                         </tr>
                       )
                     })}
                   </tbody>
                 </table>
+                {!sampled.length && (
+                  <p className="py-3 text-xs text-muted-foreground">
+                    No stage measurements in this sample.
+                  </p>
+                )}
                 <p className="pt-2 text-[10px] text-muted-foreground">
-                  Rolling two-second windows; at most 256 samples per stage. A
-                  dash means unmeasured or stale.
+                  At most 256 observations per stage. Missing or stale stages
+                  are omitted; these are independent distributions, not additive
+                  frame traces.
                 </p>
               </div>
             </details>
             <details className="border-t border-border">
-              <summary className="min-h-10 cursor-pointer px-3 py-2.5 text-xs font-medium">
-                Drops, replacements &amp; encoder opens
+              <summary className="min-h-11 cursor-pointer px-3 py-3 text-xs font-medium">
+                Frame flow & events
               </summary>
-              <dl className="space-y-1 px-3 pb-3 text-xs">
-                {Object.entries(COUNTERS).map(([key, label]) => (
-                  <div
-                    key={key}
-                    className="flex items-center justify-between gap-3"
-                  >
-                    <dt className="text-muted-foreground">{label}</dt>
-                    <dd className="font-mono">
-                      {state.totals[key as keyof typeof COUNTERS] ?? 0}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-              <CounterTrend points={state.points} />
+              <div className="space-y-3 px-3 pb-3">
+                <div className="grid grid-cols-3 gap-2 text-[10px] text-muted-foreground">
+                  {(
+                    ["receivedFrames", "renderedFrames", "redraws"] as const
+                  ).map((key) => (
+                    <div key={key}>
+                      <div className="font-mono text-lg text-foreground">
+                        {(state.totals[key] ?? 0).toLocaleString()}
+                      </div>
+                      {COUNTERS[key]}
+                    </div>
+                  ))}
+                </div>
+                <select
+                  className={selectClass}
+                  aria-label="Performance event group"
+                  value={events}
+                  onChange={(event) =>
+                    setEvents(event.target.value as keyof typeof EVENTS)
+                  }
+                >
+                  {Object.entries(EVENTS).map(([key, value]) => (
+                    <option key={key} value={key}>
+                      {value.title}
+                    </option>
+                  ))}
+                </select>
+                <PerformanceChart
+                  points={state.points}
+                  series={EVENTS[events].keys.map((key) => ({
+                    key,
+                    label: COUNTERS[key],
+                    read: (point: PerformancePoint) => point.counters[key] ?? 0,
+                  }))}
+                  seconds={seconds}
+                  scale="linear"
+                  selectedAt={selectedAt}
+                  onSelect={setSelectedAt}
+                  unit="count"
+                  title={`${EVENTS[events].title} counts`}
+                  height={160}
+                />
+                <p className="text-[10px] leading-relaxed text-muted-foreground">
+                  Counts per recorded sample. Intentional replacements, browser
+                  playback drops and media send failures have different scopes;
+                  counts may overlap and are not a network loss rate.
+                </p>
+                <details>
+                  <summary className="min-h-9 cursor-pointer text-[11px] font-medium">
+                    All totals since clear
+                  </summary>
+                  <dl className="space-y-1 pt-2 text-[11px]">
+                    {Object.entries(COUNTERS).map(([key, label]) => (
+                      <div
+                        key={key}
+                        className="flex items-center justify-between gap-3"
+                      >
+                        <dt className="text-muted-foreground">{label}</dt>
+                        <dd className="font-mono">
+                          {(state.totals[key as Counter] ?? 0).toLocaleString()}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                </details>
+              </div>
             </details>
-            <div className="flex gap-2 border-t border-border px-3 py-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={exportData}
-                disabled={!state.points.length}
-              >
-                <Download className="size-3.5" aria-hidden />
-                Export JSON
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  resetFrameTimings()
-                  performanceStats.clear()
-                }}
-              >
-                <RotateCcw className="size-3.5" aria-hidden />
-                Clear
-              </Button>
-            </div>
+            <p className="border-t border-border px-3 py-2 text-[10px] leading-relaxed text-muted-foreground">
+              Server stages cover this engine process; browser stages cover this
+              tab. First submission and video callbacks do not measure physical
+              display time. Raw observations only; no automatic fault alerts.
+            </p>
           </>
         )}
       </PanelGroup>
@@ -324,275 +535,12 @@ function NumberReadout({
   unit: string
 }) {
   return (
-    <div>
-      <div className="text-[9px] tracking-wider text-muted-foreground">
-        {label}
-      </div>
-      <div className="pt-1 font-mono text-lg leading-none tracking-tight">
+    <div className="min-w-0">
+      <div className="text-[10px] text-muted-foreground">{label}</div>
+      <div className="pt-1 font-mono text-xl leading-none tracking-tight tabular-nums">
         {value}
         <span className="ml-1 text-[10px] text-muted-foreground">{unit}</span>
       </div>
-    </div>
-  )
-}
-function TrendChart({
-  points,
-  keys,
-  statistic,
-  seconds,
-}: {
-  points: readonly PerformancePoint[]
-  keys: readonly Metric[]
-  statistic: Percentile
-  seconds: number
-}) {
-  const id = useId(),
-    [cursor, setCursor] = useState<number | null>(null),
-    [hidden, setHidden] = useState<Set<Metric>>(() => new Set())
-  const end = points.at(-1)?.at ?? 0,
-    start = end - seconds * 1000
-  const visible = useMemo(
-    () => points.filter((point) => point.at >= start),
-    [points, start],
-  )
-  const enabled = keys.filter((key) => !hidden.has(key))
-  const max = Math.max(
-    1,
-    ...visible.flatMap((point) =>
-      enabled.map((key) => point.stages[key]?.[statistic] ?? 0),
-    ),
-  )
-  const ceiling = Math.ceil(max / 4) * 4
-  const x = (at: number) => 44 + ((at - start) / (seconds * 1000)) * 580
-  const y = (value: number) => 150 - (value / ceiling) * 130
-  const active =
-    visible[Math.min(cursor ?? visible.length - 1, visible.length - 1)]
-  const path = (key: Metric) => {
-    let previous: number | null = null
-    return visible
-      .map((point) => {
-        const value = point.stages[key]?.[statistic]
-        if (value === undefined) {
-          previous = null
-          return ""
-        }
-        const command =
-          previous === null || point.at - previous > 2500 ? "M" : "L"
-        previous = point.at
-        return `${command}${x(point.at).toFixed(1)},${y(value).toFixed(1)}`
-      })
-      .join(" ")
-  }
-  return (
-    <div className="space-y-2 px-3 py-3">
-      <svg
-        viewBox="0 0 640 180"
-        role="img"
-        aria-labelledby={`${id}-title ${id}-description`}
-        className="w-full overflow-visible"
-        onPointerLeave={() => setCursor(null)}
-        onPointerMove={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect(),
-            time =
-              start +
-              ((((event.clientX - rect.left) / rect.width) * 640 - 44) / 580) *
-                seconds *
-                1000
-          let index = 0
-          for (let i = 1; i < visible.length; i++)
-            if (
-              Math.abs(visible[i]!.at - time) <
-              Math.abs(visible[index]!.at - time)
-            )
-              index = i
-          setCursor(index)
-        }}
-      >
-        <title id={`${id}-title`}>Stage latency trend in milliseconds</title>
-        <desc id={`${id}-description`}>
-          Last {seconds / 60} minutes,{" "}
-          {statistic === "p95" ? "95th percentile" : "maximum"}. Missing samples
-          appear as gaps. Use the sample slider for exact values.
-        </desc>
-        {[0, 1, 2, 3, 4].map((tick) => (
-          <g key={tick}>
-            <line
-              x1="44"
-              x2="624"
-              y1={y((ceiling * tick) / 4)}
-              y2={y((ceiling * tick) / 4)}
-              stroke="currentColor"
-              opacity=".09"
-            />
-            <text
-              x="38"
-              y={y((ceiling * tick) / 4) + 3}
-              textAnchor="end"
-              fill="currentColor"
-              opacity=".55"
-              fontSize="14"
-              fontFamily="monospace"
-            >
-              {Number(((ceiling * tick) / 4).toFixed(1))}
-            </text>
-          </g>
-        ))}
-        {keys.map(
-          (key, index) =>
-            !hidden.has(key) && (
-              <path
-                key={key}
-                d={path(key)}
-                fill="none"
-                stroke={COLORS[index % COLORS.length]}
-                strokeWidth="1.8"
-                strokeLinejoin="round"
-                strokeLinecap="round"
-              />
-            ),
-        )}
-        {active && (
-          <line
-            x1={x(active.at)}
-            x2={x(active.at)}
-            y1="20"
-            y2="150"
-            stroke="currentColor"
-            opacity=".25"
-            strokeDasharray="3 3"
-          />
-        )}
-        <text x="44" y="171" fill="currentColor" opacity=".5" fontSize="14">
-          −{seconds / 60} min
-        </text>
-        <text
-          x="624"
-          y="171"
-          textAnchor="end"
-          fill="currentColor"
-          opacity=".5"
-          fontSize="14"
-        >
-          Latest
-        </text>
-        {!visible.length && (
-          <text
-            x="334"
-            y="85"
-            textAnchor="middle"
-            fill="currentColor"
-            opacity=".5"
-            fontSize="12"
-          >
-            Waiting for samples
-          </text>
-        )}
-      </svg>
-      {visible.length > 1 && (
-        <input
-          type="range"
-          min="0"
-          max={visible.length - 1}
-          value={Math.min(cursor ?? visible.length - 1, visible.length - 1)}
-          onChange={(event) => setCursor(Number(event.target.value))}
-          aria-label="Inspect performance sample"
-          className="h-3 w-full accent-primary"
-        />
-      )}
-      <div className="flex justify-between font-mono text-[10px] text-muted-foreground">
-        <span>{active ? clock(active.at) : "No sample"}</span>
-        <span>{statistic.toUpperCase()} · ms</span>
-      </div>
-      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-        {keys.map((key, index) => (
-          <button
-            type="button"
-            key={key}
-            aria-pressed={!hidden.has(key)}
-            onClick={() =>
-              setHidden((last) => {
-                const next = new Set(last)
-                if (next.has(key)) next.delete(key)
-                else next.add(key)
-                return next
-              })
-            }
-            className={cn(
-              "flex min-h-8 items-center justify-between gap-2 text-left text-[10px]",
-              hidden.has(key) && "opacity-40",
-            )}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <span
-                className="h-0.5 w-3 shrink-0"
-                style={{ background: COLORS[index % COLORS.length] }}
-              />
-              {METRICS[key].label}
-            </span>
-            <span className="font-mono">
-              {ms(active?.stages[key]?.[statistic])}
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-function CounterTrend({ points }: { points: readonly PerformancePoint[] }) {
-  const visible = points.slice(-60)
-  const keys = [
-    "encoderOpens",
-    "sendExpired",
-    "incompleteFrames",
-    "nativeReplaced",
-  ] as const
-  const max = Math.max(
-    1,
-    ...visible.flatMap((point) => keys.map((key) => point.counters[key] ?? 0)),
-  )
-  return (
-    <div className="px-3 pb-3">
-      <svg
-        viewBox="0 0 600 90"
-        role="img"
-        aria-label="Encoder opens and discarded media per sample, last 60 samples"
-        className="w-full"
-      >
-        <line
-          x1="0"
-          x2="600"
-          y1="76"
-          y2="76"
-          stroke="currentColor"
-          opacity=".15"
-        />
-        {keys.map((key, index) => (
-          <path
-            key={key}
-            d={visible
-              .map(
-                (point, i) =>
-                  `${i ? "L" : "M"}${(i * 600) / 59},${76 - ((point.counters[key] ?? 0) / max) * 65}`,
-              )
-              .join(" ")}
-            fill="none"
-            stroke={COLORS[index]}
-            strokeWidth="1.5"
-          />
-        ))}
-      </svg>
-      <div className="grid grid-cols-2 gap-1 text-[10px] text-muted-foreground">
-        {keys.map((key, index) => (
-          <span key={key} className="inline-flex items-center gap-1">
-            <span className="h-0.5 w-3" style={{ background: COLORS[index] }} />
-            {COUNTERS[key]}
-          </span>
-        ))}
-      </div>
-      <p className="pt-2 text-[10px] text-muted-foreground">
-        Counts per recorded sample, not automatic fault alerts. Queue
-        replacements may be intentional.
-      </p>
     </div>
   )
 }

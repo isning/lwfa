@@ -11,12 +11,14 @@ import {
   renderStarted,
   renderFinished,
   resetFrameTimings,
+  latestVideoSample,
 } from "../src/lib/performance"
 import {
   decodeToEngine,
   decodeToShell,
   type PerformanceReport,
   type DecodedFrame,
+  FrameFormat,
 } from "@lwfa/proto"
 const report = (value = 10): PerformanceReport => ({
   type: "performance",
@@ -201,6 +203,18 @@ it("exports only numeric diagnostics and measurement scope", () => {
   expect(exported.points[0].at).toBe(100)
   expect(exported.scope).toContain("not physical")
   expect(Object.keys(exported)).not.toContain("password")
+})
+it("records the observed wire dimensions and codec without window titles or addresses", () => {
+  performanceStats.setEnabled(true)
+  frameReceived({ header: { window: 5, width: 4060, height: 2670, format: FrameFormat.Hevc } } as DecodedFrame)
+  const video = latestVideoSample()
+  expect(video).toMatchObject({ window: 5, width: 4060, height: 2670, codec: "HEVC" })
+  performanceStats.tick(performance.now(), { fps: 51, kbits: 22000, bufferedKiB: 0, video })
+  const exported = JSON.parse(exportPerformance(performanceStats.snapshot()))
+  expect(exported.points.at(-1).video).toEqual(video)
+  expect(Object.keys(video!)).toEqual(["window", "width", "height", "codec", "receivedAt"])
+  resetFrameTimings()
+  expect(latestVideoSample()).toBeNull()
 })
 it("validates optional probe bounds and bounded diagnostic replies", () => {
   expect(
