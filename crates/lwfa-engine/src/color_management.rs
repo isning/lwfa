@@ -1,4 +1,4 @@
-//! Parametric color-management-v1. ICC and arbitrary chromaticities are not
+//! Parametric color-management-v1. ICC and arbitrary source chromaticities are not
 //! advertised. Surface descriptions use Smithay's transaction cache, including
 //! synchronized subsurfaces, rather than applying requests immediately.
 
@@ -498,9 +498,8 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, Parameters> for Lwfa {
 // the named source triangle and luminance interval. Invalid descriptions fail
 // gracefully rather than terminating an otherwise well-formed client.
 fn valid_mastering(description: Description) -> bool {
-    if let Some((min,max)) = description.mastering_luminance {
-        if min as f32 / 10000.0 < description.min_luminance || max as f32 > description.max_luminance { return false; }
-    }
+    if let Some((min,max)) = description.mastering_luminance
+        && (min as f32 / 10000.0 < description.min_luminance || max as f32 > description.max_luminance) { return false; }
     let Some(coords) = description.mastering_primaries else { return true };
     let source = match description.primaries {
         Primaries::Srgb => [[640000,330000],[300000,600000],[150000,60000]],
@@ -508,7 +507,7 @@ fn valid_mastering(description: Description) -> bool {
         Primaries::Bt2020 => [[708000,292000],[170000,797000],[131000,46000]],
     };
     let cross = |a: [i32;2], b: [i32;2], p: [i32;2]| (i128::from(b[0])-i128::from(a[0]))*(i128::from(p[1])-i128::from(a[1]))-(i128::from(b[1])-i128::from(a[1]))*(i128::from(p[0])-i128::from(a[0]));
-    let points: Vec<_> = coords.chunks_exact(2).map(|xy| [xy[0],xy[1]]).collect();
+    let points = coords.as_chunks::<2>().0;
     if cross(points[0],points[1],points[2]) == 0 { return false; }
     points.iter().all(|&p| (0..3).all(|i| cross(source[i],source[(i+1)%3],p)>=0))
 }

@@ -20,7 +20,7 @@ impl PackedP010 {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let packed: Size<i32, Physical> = ((size.w + 3) / 4, size.h + (size.h + 1) / 2).into();
         let program = renderer.compile_custom_texture_shader(
-            include_str!("hdr_p010.frag"),
+            &crate::color_render::shader_source(include_str!("hdr_p010.frag")),
             &[
                 UniformName::new("source_size", UniformType::_2f),
                 UniformName::new("packed_size", UniformType::_2f),

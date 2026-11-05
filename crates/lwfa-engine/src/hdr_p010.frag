@@ -16,14 +16,12 @@ varying vec2 v_coords;
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
+//_WORKING_TO_PQ_
 vec3 pq_at(vec2 pixel) {
     vec2 uv = (clamp(pixel, vec2(0.0), source_size-1.0)+0.5)/source_size;
     // Input is premultiplied linear sRGB in nits with an 80-nit working white.
     // Flatten transparency over black in linear light, before PQ encoding.
-    vec3 rgb = texture2D(tex, uv).rgb * (203.0/80.0);
-    rgb = mat3(0.627404,0.069097,0.016391, 0.329283,0.919540,0.088013, 0.043313,0.011362,0.895595) * rgb;
-    vec3 p = pow(clamp(rgb/10000.0,0.0,1.0),vec3(0.1593017578125));
-    return pow((0.8359375+18.8515625*p)/(1.0+18.6875*p),vec3(78.84375));
+    return working_to_pq(texture2D(tex, uv).rgb);
 }
 vec3 yuv(vec3 rgb) {
     float y = dot(rgb, vec3(0.2627,0.6780,0.0593));

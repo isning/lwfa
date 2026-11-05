@@ -75,11 +75,15 @@ pub fn init_backend(state: &mut crate::state::Lwfa, renderer: &mut GlesRenderer)
     }
 }
 
+pub fn shader_source(template: &str) -> String {
+    template.replace("//_WORKING_TO_PQ_", include_str!("working_to_pq.glsl"))
+}
+
 pub fn program(
     renderer: &mut GlesRenderer,
 ) -> Result<GlesTexProgram, smithay::backend::renderer::gles::GlesError> {
     renderer.compile_custom_texture_shader(
-        include_str!("color.frag"),
+        &shader_source(include_str!("color.frag")),
         &[
             "source_tf",
             "source_primaries",
@@ -473,6 +477,8 @@ mod tests {
         for (description,values,expected) in [
             (Description { reference_white:203.0,min_luminance:0.0,..Description::named(crate::color::Primaries::Srgb,Transfer::Linear) },[-0.25,1.25,5.0],[-20.0*80.0/203.0,100.0*80.0/203.0,400.0*80.0/203.0]),
             (Description::named(crate::color::Primaries::Bt2020,Transfer::Hlg),[0.75;3],[80.06;3]),
+            // Saturated P3 catches using BT.709 weights for the HLG OOTF.
+            (Description::named(crate::color::Primaries::DisplayP3,Transfer::Hlg),[0.75,0.1,0.2],[73.63913,-1.744573,2.088109]),
         ] {
             let mut target=renderer.bind(&mut source).unwrap();
             let mut frame=renderer.render(&mut target,(2,2).into(),Transform::Normal).unwrap();

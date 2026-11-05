@@ -246,10 +246,22 @@ struct CaptureCounts {
     delivered: u64,
     gpu_direct: u64,
     cpu_readbacks: u64,
+    cpu_requested: u64,
     cpu_copies: u64,
     cpu_copy_bytes: u64,
     gpu_unavailable: u64,
     gpu_failures: u64,
+}
+
+impl CaptureCounts {
+    fn packed_readback(&mut self, gpu_requested: bool, gpu_attempted: bool, width: u32, height: u32) {
+        self.cpu_readbacks += 1;
+        self.cpu_copies += 1;
+        self.cpu_copy_bytes += u64::from(width)*u64::from(height)*2 + u64::from(width.div_ceil(2))*u64::from(height.div_ceil(2))*4;
+        if !gpu_requested { self.cpu_requested += 1; }
+        else if gpu_attempted { self.gpu_failures += 1; }
+        else { self.gpu_unavailable += 1; }
+    }
 }
 
 struct CaptureDiagnostics {
@@ -432,6 +444,7 @@ impl SurfaceCapture {
                     capture_fps = counts.delivered as f64 / elapsed.as_secs_f64(),
                     gpu_direct = counts.gpu_direct,
                     cpu_readbacks = counts.cpu_readbacks,
+                    cpu_requested = counts.cpu_requested,
                     cpu_copies = counts.cpu_copies,
                     cpu_copy_bytes = counts.cpu_copy_bytes,
                     gpu_unavailable = counts.gpu_unavailable,
@@ -713,16 +726,6 @@ impl SurfaceCapture {
             }
         }
         drop(framebuffer);
-        if let Some(linear) = target.linear.as_ref() {
-            let mut framebuffer = renderer.bind(&mut target.texture).ok()?;
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Normal).ok()?;
-            frame.clear(Color32F::TRANSPARENT, &[whole]).ok()?;
-            let peak = target.colors.values().map(|color| color.target_peak / color.reference_white).fold(1.0_f32, f32::max);
-            let resolve = crate::color::Description { reference_white: 80.0, target_peak: peak * 80.0, ..Default::default() };
-            frame.override_default_tex_program(self.color_program.as_ref()?.clone(), crate::color_render::uniforms(resolve, if self.hdr { 2.0 } else { 1.0 }));
-            Frame::render_texture_from_to(&mut frame, linear, Rectangle::from_size(buffer_size(size)).to_f64(), whole, &[whole], &[], Transform::Normal, 1.0).ok()?;
-            let _fence = frame.finish().ok()?;
-        }
         let counts = &mut self
             .diagnostics
             .entry(id)
@@ -745,13 +748,26 @@ impl SurfaceCapture {
                         counts.gpu_direct += 1;
                         Some(frame)
                     } else {
-                        packed.cpu_frame(renderer).inspect_err(|err| tracing::warn!("P010 readback failed: {err}")).ok()
+                        let cpu = packed.cpu_frame(renderer).inspect_err(|err| tracing::warn!("P010 readback failed: {err}")).ok();
+                        if cpu.is_some() { counts.packed_readback(gpu_direct, target.hdr_bridge_attempted, width, height); }
+                        cpu
                     };
                     if let Some(frame) = frame {
                         return Some(CapturedFrame { id, width, height, frame: PooledFrame::owned(frame), hdr: true, hdr_peak: target.hdr_peak, color_generation: target.color_generation });
                     }
                 }
             }
+        }
+
+        if let Some(linear) = target.linear.as_ref() {
+            let mut framebuffer = renderer.bind(&mut target.texture).ok()?;
+            let mut frame = renderer.render(&mut framebuffer, size, Transform::Normal).ok()?;
+            frame.clear(Color32F::TRANSPARENT, &[whole]).ok()?;
+            let peak = target.colors.values().map(|color| color.target_peak / color.reference_white).fold(1.0_f32, f32::max);
+            let resolve = crate::color::Description { reference_white: 80.0, target_peak: peak * 80.0, ..Default::default() };
+            frame.override_default_tex_program(self.color_program.as_ref()?.clone(), crate::color_render::uniforms(resolve, if self.hdr { 2.0 } else { 1.0 }));
+            Frame::render_texture_from_to(&mut frame, linear, Rectangle::from_size(buffer_size(size)).to_f64(), whole, &[whole], &[], Transform::Normal, 1.0).ok()?;
+            let _fence = frame.finish().ok()?;
         }
 
         // The zero-copy path: hand the rendered texture to CUDA and return
@@ -780,6 +796,8 @@ impl SurfaceCapture {
             counts.gpu_failures += 1;
         } else if gpu_direct {
             counts.gpu_unavailable += 1;
+        } else {
+            counts.cpu_requested += 1;
         }
 
         let Ok(mut framebuffer) = renderer
@@ -1053,6 +1071,16 @@ fn rows(frame: &ff::frame::Video, width: u32, height: u32) -> impl Iterator<Item
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
+
+    #[test]
+    fn packed_hdr_fallback_reports_actual_path_and_copy_bytes() {
+        for (requested,attempted,reason) in [(false,false,0),(true,false,1),(true,true,2)] {
+            let mut counts=CaptureCounts::default();
+            counts.packed_readback(requested,attempted,5,3);
+            assert_eq!((counts.cpu_readbacks,counts.cpu_copies,counts.cpu_copy_bytes),(1,1,54));
+            assert_eq!((counts.cpu_requested,counts.gpu_unavailable,counts.gpu_failures),match reason {0=>(1,0,0),1=>(0,1,0),_=>(0,0,1)});
+        }
+    }
 
     #[test]
     fn capture_reports_observed_snapshots_without_inventing_source_frames() {

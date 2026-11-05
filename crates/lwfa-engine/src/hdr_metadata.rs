@@ -38,11 +38,10 @@ pub fn insert(bytes: &mut Vec<u8>, peak: f32) {
             i += 1;
             continue;
         };
-        if let Some(header) = bytes.get(i + prefix) {
-            if (header >> 1) & 63 <= 31 {
-                insertion = i;
-                break;
-            }
+        if let Some(header) = bytes.get(i + prefix)
+            && (header >> 1) & 63 <= 31 {
+            insertion = i;
+            break;
         }
         i += prefix;
     }

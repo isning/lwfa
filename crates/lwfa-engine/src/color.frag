@@ -21,6 +21,7 @@ varying vec2 v_coords;
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
+//_WORKING_TO_PQ_
 const float m1 = 0.1593017578125;
 const float m2 = 78.84375;
 const float c1 = 0.8359375;
@@ -32,7 +33,7 @@ vec3 decode(vec3 v) {
     v = max(v, vec3(0.0));
     if (source_tf > 3.5) {
         vec3 scene = mix(v*v/3.0, (exp((v-0.55991073)/0.17883277)+0.28466892)/12.0, step(vec3(0.5),v));
-        vec3 weights = source_primaries > 1.5 ? vec3(0.2627,0.6780,0.0593) : vec3(0.2126,0.7152,0.0722);
+        vec3 weights = source_primaries > 1.5 ? vec3(0.2627,0.6780,0.0593) : (source_primaries > 0.5 ? vec3(0.228975,0.691739,0.079287) : vec3(0.2126,0.7152,0.0722));
         float gamma = 1.2 + 0.42 * log(source_peak/1000.0)/log(10.0);
         return scene * pow(max(dot(scene,weights),0.0000001),gamma-1.0) * (source_peak-source_black);
     }
@@ -75,11 +76,7 @@ void main() {
         if (peak > 1.0 && y > 0.0) rgb *= (1.0 + y/(peak*peak)) / (1.0+y);
         rgb = srgb(clamp(rgb, 0.0, 1.0));
     } else {
-        // Linear sRGB at 80-nit reference -> BT.2020/PQ at 203-nit white.
-        rgb *= 203.0 / 80.0;
-        rgb = mat3(0.627404,0.069097,0.016391, 0.329283,0.919540,0.088013, 0.043313,0.011362,0.895595) * rgb;
-        vec3 p = pow(clamp(rgb/10000.0,0.0,1.0), vec3(m1));
-        rgb = pow((c1+c2*p)/(1.0+c3*p), vec3(m2));
+        rgb = working_to_pq(rgb);
     }
     gl_FragColor = vec4(rgb * pixel.a, pixel.a) * alpha;
 #if defined(DEBUG_FLAGS)
