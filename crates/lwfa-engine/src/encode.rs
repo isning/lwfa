@@ -279,19 +279,28 @@ impl Encoders {
         // Streaming again, so it is no longer a candidate for reclaiming.
         let returning = self.retired.remove(&frame.id).is_some();
 
-        if let Some((width, height, bitrate, color_generation)) = self
+        if let Some((width, height, bitrate, color_generation, hdr_peak)) = self
             .sessions
             .get(&frame.id)
-            .map(|s| (s.width, s.height, s.bitrate, s.color_generation))
+            .map(|s| (s.width, s.height, s.bitrate, s.color_generation, s.hdr_peak))
         {
             // A returning window's session was built for whatever the budget
             // was when it left. Reusing it as-is would quietly ignore the share
             // it has now, so it is rebuilt on the same threshold `set_rates`
             // uses, and only when the share really moved.
             let stale = returning && worth_rebuilding(bitrate, self.rate_for(frame.id));
-            if width == frame.width && height == frame.height && !stale && color_generation == frame.color_generation {
+            // Capture has already converted every source into the codec's fixed
+            // output space. A new popup or source description changes pixels,
+            // not encoder parameters. Only HDR's output peak affects the SEI
+            // metadata stamped by this session and requires a fresh keyframe.
+            let metadata_changed = frame.hdr && hdr_peak != frame.hdr_peak;
+            if width == frame.width && height == frame.height && !stale && !metadata_changed {
                 return true;
             }
+            tracing::debug!(window = %frame.id, old_width = width, old_height = height,
+                width = frame.width, height = frame.height, rate_changed = stale,
+                metadata_changed, old_color_generation = color_generation,
+                color_generation = frame.color_generation, "rebuilding video encoder");
             // Resized. H.264 cannot change resolution mid-stream, so the
             // session is rebuilt and the next frame is an IDR.
             self.sessions.remove(&frame.id);
@@ -679,8 +688,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NVENC; run alone with --ignored --test-threads=1"]
+    fn source_surface_churn_preserves_sdr_encoder() {
+        let rgba: Vec<u8> = (0..320 * 240).flat_map(|_| [80, 100, 120, 255]).collect();
+        for codec in [lwfa_proto::Codec::H264, lwfa_proto::Codec::Hevc] {
+            let mut encoders = Encoders::default();
+            encoders.set_codec(Some(codec));
+            let mut frame = CapturedFrame::for_tests(WindowId(1), 320, 240, &rgba);
+            for generation in 1..=5 {
+                frame.color_generation = generation;
+                let encoded = encoders.encode(&mut frame).unwrap();
+                assert_ne!(encoded.format, FrameFormat::Jpeg);
+                assert_eq!(encoded.keyframe, generation == 1,
+                    "source surface changes must not reset the encoded reference chain");
+                assert_eq!(encoders.sessions[&frame.id].pts, generation as i64);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires a working HEVC Main10 NVENC encoder"]
-    fn source_color_changes_force_a_new_hdr_keyframe() {
+    fn only_output_metadata_changes_force_a_new_hdr_keyframe() {
         let code = (crate::color::encode_pq(203.0)*1023.0).round() as u32;
         let packed = code | code << 10 | code << 20 | 3 << 30;
         let bytes: Vec<_> = (0..320*240).flat_map(|_| packed.to_ne_bytes()).collect();
@@ -694,9 +722,12 @@ mod tests {
         assert_eq!(first.format, FrameFormat::HevcHdr);
         assert!(first.keyframe);
         frame.color_generation = 2;
+        let unchanged = encoders.encode(&mut frame).unwrap();
+        assert!(!unchanged.keyframe, "unchanged output metadata must preserve the session");
+        frame.hdr_peak = 1000.0;
         let changed = encoders.encode(&mut frame).unwrap();
         assert_eq!(changed.format, FrameFormat::HevcHdr);
-        assert!(changed.keyframe, "a description-only change must not wait for the GOP");
+        assert!(changed.keyframe, "an output peak change must not wait for the GOP");
     }
 
     #[test]
