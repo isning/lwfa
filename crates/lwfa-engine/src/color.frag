@@ -76,7 +76,10 @@ void main() {
         if (peak > 1.0 && y > 0.0) rgb *= (1.0 + y/(peak*peak)) / (1.0+y);
         rgb = srgb(clamp(rgb, 0.0, 1.0));
     } else {
-        rgb = working_to_pq(rgb);
+        // Video has no alpha plane. Flatten over black in linear light,
+        // matching packed P010, rather than multiplying PQ code values.
+        rgb = working_to_pq(rgb * pixel.a);
+        pixel.a = 1.0;
     }
     gl_FragColor = vec4(rgb * pixel.a, pixel.a) * alpha;
 #if defined(DEBUG_FLAGS)

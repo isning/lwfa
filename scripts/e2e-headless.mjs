@@ -109,7 +109,7 @@ async function verifyStream(connection, id, filename, expectedHdr = hdrOutput, c
   connection.frames.length = 0
   connection.send({ type: "setViewport", width: 800, height: 600, scale: 1 })
   await connection.wait(() => (connection.hello.output.width === 800 && connection.hello.output.height === 600) || connection.messages.find((message) => message.type === "outputChanged" && message.output.width === 800 && message.output.height === 600), "headless viewport resize")
-  connection.send({ type: "setLayout", windows: [{ id, rect: { x: 0, y: 0, w: 320, h: 240 }, z: 0 }], animate: null })
+  connection.send({ type: "setLayout", windows: [{ id, rect: { x: 0, y: 0, width: 320, height: 240 }, z: 0 }], animate: null })
   connection.send({ type: "setStreams", windows: [id], codecs })
   const frame = await connection.wait(() => connection.frames.find((frame) => frame.header.window === id && frame.header.format === (expectedHdr ? FrameFormat.HevcHdr : FrameFormat.Jpeg) && frame.header.keyframe), "self-contained window frame")
   assert.equal(frame.header.format, expectedHdr ? FrameFormat.HevcHdr : FrameFormat.Jpeg)
@@ -184,6 +184,7 @@ try {
   const second = await connect(port)
   assert(second.hello.windows.some((candidate) => candidate.id === window.id), "reconnect must restore the same window")
   await verifyStream(second, window.id, "reconnected.jpg")
+  assert(!logs.engine.includes("undecodable message from shell"), "test protocol messages must be accepted by the engine")
   console.log(`PASS: no-host EGL, ${logs.client.includes("DMA-BUF imported") ? "DMA-BUF" : "wl_shm"}, viewport, decoded ${hdrOutput ? "Main10/PQ" : "JPEG"} pixels, ${disconnectedMs}ms disconnect and same-window reconnect`)
 } finally {
   for (const socket of sockets) await close(socket).catch(() => {})

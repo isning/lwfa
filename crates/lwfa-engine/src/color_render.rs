@@ -500,4 +500,41 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires EGL/GLES float and RGB10 rendering"]
+    fn portable_hdr_flattens_alpha_in_linear_light() {
+        let mut renderer=crate::headless::renderer(None).unwrap();
+        let shader=program(&mut renderer).unwrap();
+        let mut linear: GlesTexture=renderer.create_buffer(Fourcc::Abgr16161616f,(2,2).into()).unwrap();
+        let mut target=renderer.bind(&mut linear).unwrap();
+        let mut frame=renderer.render(&mut target,(2,2).into(),Transform::Normal).unwrap();
+        frame.clear(Color32F::new(40.0,40.0,40.0,0.5),&[Rectangle::from_size((2,2).into())]).unwrap();
+        frame.finish().unwrap().wait().unwrap(); drop(target);
+        let mut rgb10: GlesTexture=renderer.create_buffer(Fourcc::Abgr2101010,(2,2).into()).unwrap();
+        let mut target=renderer.bind(&mut rgb10).unwrap();
+        let mut frame=renderer.render(&mut target,(2,2).into(),Transform::Normal).unwrap();
+        frame.clear(Color32F::TRANSPARENT,&[Rectangle::from_size((2,2).into())]).unwrap();
+        frame.override_default_tex_program(shader,uniforms(Description::default(),2.0));
+        Frame::render_texture_from_to(&mut frame,&linear,Rectangle::from_size((2,2).into()).to_f64(),Rectangle::from_size((2,2).into()),&[Rectangle::from_size((2,2).into())],&[],Transform::Normal,1.0).unwrap();
+        frame.finish().unwrap().wait().unwrap();
+        let mapping=renderer.copy_framebuffer(&target,Rectangle::from_size((2,2).into()),Fourcc::Abgr2101010).unwrap(); drop(target);
+        let bytes=renderer.map_texture(&mapping).unwrap();
+        let expected=(crate::color::encode_pq(101.5)*1023.0).round() as i32;
+        for bytes in bytes.as_chunks::<4>().0 {
+            let pixel=u32::from_ne_bytes(*bytes);
+            assert_eq!(pixel>>30,3,"opaque video resolve");
+            for shift in [0,10,20] { assert!((((pixel>>shift)&1023) as i32-expected).abs()<=1); }
+        }
+        let fallback=crate::color::p010_from_rgb10(bytes,2,2);
+        let mut packed=crate::hdr_gpu::PackedP010::new(&mut renderer,(2,2).into()).unwrap();
+        packed.render(&mut renderer,&linear).unwrap();
+        let direct=packed.cpu_frame(&mut renderer).unwrap();
+        for plane in 0..2 {
+            for word in 0..2 {
+                let code=|frame: &ffmpeg_next::frame::Video| u16::from_ne_bytes(frame.data(plane)[word*2..word*2+2].try_into().unwrap())>>6;
+                assert!((i32::from(code(&fallback))-i32::from(code(&direct))).abs()<=1,"packed and fallback HDR must agree");
+            }
+        }
+    }
+
 }
